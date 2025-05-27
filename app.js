@@ -24,8 +24,8 @@ try {
 
   const allowedOrigins = [
     'http://localhost:8080',
-    'https://mooc-frontend.onrender.com',
-    'https://mooc-frontend.onrender.com/admin'
+    'https://mooc-frontend-9kdg.onrender.com',
+    'https://moocs.pmu.edu'
   ];
 
   app.use(cors({
