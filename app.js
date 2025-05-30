@@ -3,8 +3,8 @@ const cors = require('cors');
 const path = require('path');
 const multer = require('multer');
 const session = require('express-session');
-const SQLiteStore = require('connect-sqlite3')(session);
-const fs = require('fs'); // Added for directory creation
+const PGSimple = require('connect-pg-simple')(session);
+const { Pool } = require('pg');
 
 try {
   const adminRoutes = require('./routes/admin');
@@ -44,17 +44,17 @@ try {
 
   app.options('*', cors());
 
-  // Create db directory if it doesn't exist
-  const dbDir = path.join(__dirname, 'db');
-  if (!fs.existsSync(dbDir)) {
-    fs.mkdirSync(dbDir, { recursive: true });
-    console.log(`Created directory: ${dbDir}`);
-  }
+  // PostgreSQL connection pool
+  const pgPool = new Pool({
+    connectionString: 'postgresql://root:QgaoJrvWJaFia6GxETVtRXSNV9P0UVfm@dpg-d0si1oadbo4c73f3midg-a.oregon-postgres.render.com/mooc_vmh7',
+    ssl: { rejectUnauthorized: false } // Required for Render's external PostgreSQL
+  });
 
   // Session middleware
-  const sessionStore = new SQLiteStore({
-    db: 'sessions.db',
-    dir: dbDir,
+  const sessionStore = new PGSimple({
+    pool: pgPool,
+    tableName: 'sessions',
+    createTableIfMissing: true
   });
 
   // Handle session store errors
@@ -98,7 +98,6 @@ try {
         if (!username) {
           return res.status(400).json({ error: 'Username is required for admin login' });
         }
-        // Delegate to admin login handler
         return adminRoutes.stack
           .find(layer => layer.route && layer.route.path === '/login' && layer.route.methods.post)
           .route.stack[0].handle(req, res);
@@ -106,7 +105,6 @@ try {
         if (!username) {
           return res.status(400).json({ error: 'Username is required for staff login' });
         }
-        // Delegate to staff login handler
         return adminRoutes.stack
           .find(layer => layer.route && layer.route.path === '/staff/login' && layer.route.methods.post)
           .route.stack[0].handle(req, res);
@@ -114,7 +112,6 @@ try {
         if (!registerNo) {
           return res.status(400).json({ error: 'Register number is required for student login' });
         }
-        // Delegate to student login handler
         return adminRoutes.stack
           .find(layer => layer.route && layer.route.path === '/student/login' && layer.route.methods.post)
           .route.stack[0].handle(req, res);
@@ -139,7 +136,7 @@ try {
   app.use('/api/history', historyRoutes);
   app.use('/api/public-enrollment', publicEnrollmentRoutes);
   app.use('/api/student-profile', studentProfileRoutes);
-  app.use('/api/results', ResultsRoutes); // Added ResultsRoutes
+  app.use('/api/results', ResultsRoutes);
   app.use('/api', authRoutes);
 
   // Debug endpoint to list all registered routes

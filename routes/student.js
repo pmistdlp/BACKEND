@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../model');
+const pgPool = require('../model');
 const { getISTTimestamp } = require('../utils/helpers');
 const multer = require('multer');
 const XLSX = require('xlsx');
@@ -41,7 +41,7 @@ const singleFileUpload = multer({
 }).single('file');
 
 // Multer configuration for photo and e-signature uploads
-const upload = require('../utils/multer'); // Use existing multer configuration
+const upload = require('../utils/multer');
 
 // Validation function for DOB (8 digits)
 const isValidDOB = (dob) => {
@@ -62,29 +62,53 @@ router.get('/debug', (req, res) => {
   res.json({ message: 'Student router is active', timestamp: new Date().toISOString() });
 });
 
-// Student routes
-router.get('/', (req, res) => {
+// Fetch all students
+router.get('/', async (req, res) => {
   console.log('Received GET /api/student at', new Date().toISOString());
-  db.all(`SELECT * FROM students`, [], (err, rows) => {
-    if (err) {
-      console.error('Database error fetching students:', err.stack);
-      return res.status(500).json({ error: `Internal server error: ${err.message}` });
-    }
+  try {
+    const { rows } = await pgPool.query(
+      `SELECT id, name, registerNo, dob, aadharNumber, abcId, photo, esignature, source FROM students`
+    );
     console.log('Students fetched:', rows);
     res.json(rows || []);
-  });
+  } catch (err) {
+    console.error('Database error fetching students:', err.stack);
+    return res.status(500).json({ error: `Internal server error: ${err.message}` });
+  }
 });
 
-router.post('/', upload, (req, res) => {
+// Fetch student by registerNo (case-insensitive)
+router.get('/register/:registerNo', async (req, res) => {
+  console.log(`Received GET /api/student/register/${req.params.registerNo} at`, new Date().toISOString());
+  try {
+    const { rows } = await pgPool.query(
+      `SELECT id, name, registerNo, dob, aadharNumber, abcId, photo, esignature, source 
+       FROM students 
+       WHERE LOWER(registerNo) = LOWER($1)`,
+      [req.params.registerNo]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+    console.log('Student fetched:', rows[0]);
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Database error fetching student by registerNo:', err.stack);
+    return res.status(500).json({ error: `Internal server error: ${err.message}` });
+  }
+});
+
+// Create a new student
+router.post('/', upload, async (req, res) => {
   console.log('Received POST /api/student at', new Date().toISOString(), 'with body:', req.body, 'files:', req.files);
   const { name, registerNo, dob, password, aadharNumber, abcId, userType, userId } = req.body;
-  if (!name || !registerNo || !dob) {
-    console.log('Validation failed: Name, Register No, or DOB missing');
-    return res.status(400).json({ error: 'Name, Register No, and DOB are required' });
+  if (!name || !registerNo) {
+    console.log('Validation failed: Name or Register No missing');
+    return res.status(400).json({ error: 'Name and Register No are required' });
   }
-  if (!isValidDOB(dob)) {
+  if (dob && !isValidDOB(dob)) {
     console.log('Validation failed: Invalid DOB format:', dob);
-    return res.status(400).json({ error: 'DOB must be 8 digits (e.g., 28022025 or 12345678)' });
+    return res.status(400).json({ error: 'DOB must be 8 digits (e.g., 28042005) if provided' });
   }
   const cleanedRegisterNo = cleanNumber(registerNo);
   const cleanedAadharNumber = cleanNumber(aadharNumber);
@@ -93,45 +117,42 @@ router.post('/', upload, (req, res) => {
     console.log('Validation failed: Invalid Register No:', registerNo);
     return res.status(400).json({ error: 'Register No must be a valid number' });
   }
-  const studentPassword = password || dob;
+  const studentPassword = password || dob || '';
   const source = userType === 'admin' ? 'manual' : 'registration';
   const photo = req.files && req.files.photo ? `/Uploads/${req.files.photo[0].filename}` : null;
   const eSignature = req.files && req.files.eSignature ? `/Uploads/${req.files.eSignature[0].filename}` : null;
 
-  db.run(
-    `INSERT INTO students (name, registerNo, dob, password, aadharNumber, abcId, photo, eSignature, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [name, cleanedRegisterNo, dob, studentPassword, cleanedAadharNumber || null, cleanedAbcId || null, photo, eSignature, source],
-    function (err) {
-      if (err) {
-        console.error('Database error creating student:', err.stack);
-        return res.status(400).json({ error: `Failed to create student: ${err.message}` });
-      }
-      const studentId = this.lastID;
-      db.run(
-        `INSERT INTO student_history (studentId, action, userType, userId, timestamp) VALUES (?, ?, ?, ?, ?)`,
-        [studentId, 'created', userType, userId, getISTTimestamp()],
-        (err) => {
-          if (err) {
-            console.error('Database error creating student history:', err.stack);
-            return res.status(400).json({ error: `Failed to log student history: ${err.message}` });
-          }
-          res.json({ message: 'Student created', studentId });
-        }
-      );
-    }
-  );
+  try {
+    const studentResult = await pgPool.query(
+      `INSERT INTO students (name, registerNo, dob, password, aadharNumber, abcId, photo, esignature, source) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      [name, cleanedRegisterNo, dob || null, studentPassword, cleanedAadharNumber || null, cleanedAbcId || null, photo, eSignature, source]
+    );
+    const studentId = studentResult.rows[0].id;
+
+    await pgPool.query(
+      `INSERT INTO student_history (studentid, action, usertype, userid, timestamp) VALUES ($1, $2, $3, $4, $5)`,
+      [studentId, 'created', userType, userId, getISTTimestamp()]
+    );
+
+    res.json({ message: 'Student created', studentId });
+  } catch (err) {
+    console.error('Database error creating student:', err.stack);
+    return res.status(400).json({ error: `Failed to create student: ${err.message}` });
+  }
 });
 
-router.put('/:id', upload, (req, res) => {
+// Update a student
+router.put('/:id', upload, async (req, res) => {
   console.log('Received PUT /api/student/:id at', new Date().toISOString(), 'with body:', req.body, 'files:', req.files);
   const { name, registerNo, dob, password, aadharNumber, abcId, userType, userId } = req.body;
-  if (!name || !registerNo || !dob) {
-    console.log('Validation failed: Name, Register No, or DOB missing');
-    return res.status(400).json({ error: 'Name, Register No, and DOB are required' });
+  if (!name || !registerNo) {
+    console.log('Validation failed: Name or Register No missing');
+    return res.status(400).json({ error: 'Name and Register No are required' });
   }
-  if (!isValidDOB(dob)) {
+  if (dob && !isValidDOB(dob)) {
     console.log('Validation failed: Invalid DOB format:', dob);
-    return res.status(400).json({ error: 'DOB must be 8 digits (e.g., 28022025 or 12345678)' });
+    return res.status(400).json({ error: 'DOB must be 8 digits (e.g., 28042005) if provided' });
   }
   const cleanedRegisterNo = cleanNumber(registerNo);
   const cleanedAadharNumber = cleanNumber(aadharNumber);
@@ -140,56 +161,77 @@ router.put('/:id', upload, (req, res) => {
     console.log('Validation failed: Invalid Register No:', registerNo);
     return res.status(400).json({ error: 'Register No must be a valid number' });
   }
-  const studentPassword = password || dob;
+  const studentPassword = password || dob || '';
   const photo = req.files && req.files.photo ? `/Uploads/${req.files.photo[0].filename}` : null;
   const eSignature = req.files && req.files.eSignature ? `/Uploads/${req.files.eSignature[0].filename}` : null;
 
-  db.run(
-    `UPDATE students SET name = ?, registerNo = ?, dob = ?, password = ?, aadharNumber = ?, abcId = ?, photo = COALESCE(?, photo), eSignature = COALESCE(?, eSignature) WHERE id = ?`,
-    [name, cleanedRegisterNo, dob, studentPassword, cleanedAadharNumber || null, cleanedAbcId || null, photo, eSignature, req.params.id],
-    (err) => {
-      if (err) {
-        console.error('Database error updating student:', err.stack);
-        return res.status(400).json({ error: `Failed to update student: ${err.message}` });
-      }
-      db.run(
-        `INSERT INTO student_history (studentId, action, userType, userId, timestamp) VALUES (?, ?, ?, ?, ?)`,
-        [req.params.id, 'updated', userType, userId, getISTTimestamp()],
-        (err) => {
-          if (err) {
-            console.error('Database error updating student history:', err.stack);
-            return res.status(400).json({ error: `Failed to log student history: ${err.message}` });
-          }
-          res.json({ message: 'Student updated' });
-        }
-      );
-    }
-  );
-});
-
-router.delete('/:id', (req, res) => {
-  console.log('Received DELETE /api/student/:id at', new Date().toISOString(), 'with body:', req.body);
-  const { userType, userId } = req.body;
-  db.run(`DELETE FROM students WHERE id = ?`, [req.params.id], (err) => {
-    if (err) {
-      console.error('Database error deleting student:', err.stack);
-      return res.status(400).json({ error: `Failed to delete student: ${err.message}` });
-    }
-    db.run(
-      `INSERT INTO student_history (studentId, action, userType, userId, timestamp) VALUES (?, ?, ?, ?, ?)`,
-      [req.params.id, 'deleted', userType, userId, getISTTimestamp()],
-      (err) => {
-        if (err) {
-          console.error('Database error deleting student history:', err.stack);
-          return res.status(400).json({ error: `Failed to log student history: ${err.message}` });
-        }
-        res.json({ message: 'Student deleted' });
-      }
+  try {
+    const updateResult = await pgPool.query(
+      `UPDATE students SET name = $1, registerNo = $2, dob = $3, password = $4, aadharNumber = $5, abcId = $6, 
+       photo = COALESCE($7, photo), esignature = COALESCE($8, esignature) WHERE id = $9`,
+      [name, cleanedRegisterNo, dob || null, studentPassword, cleanedAadharNumber || null, cleanedAbcId || null, photo, eSignature, req.params.id]
     );
-  });
+    if (updateResult.rowCount === 0) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    await pgPool.query(
+      `INSERT INTO student_history (studentid, action, usertype, userid, timestamp) VALUES ($1, $2, $3, $4, $5)`,
+      [req.params.id, 'updated', userType, userId, getISTTimestamp()]
+    );
+
+    res.json({ message: 'Student updated' });
+  } catch (err) {
+    console.error('Database error updating student:', err.stack);
+    return res.status(400).json({ error: `Failed to update student: ${err.message}` });
+  }
 });
 
-// Bulk upload routes
+// Delete a student
+router.delete('/:id', async (req, res) => {
+  console.log('Received DELETE /api/student/:id at', new Date().toISOString(), 'with params:', req.params, 'body:', req.body);
+  const { userType, userId } = req.body;
+  const studentId = req.params.id;
+  let client;
+
+  try {
+    client = await pgPool.connect();
+    await client.query('BEGIN');
+
+    await pgPool.query(
+      `INSERT INTO student_history (studentid, action, usertype, userid, timestamp) VALUES ($1, $2, $3, $4, $5)`,
+      [studentId, 'deleted', userType, userId, getISTTimestamp()]
+    );
+
+    await client.query(`DELETE FROM student_results WHERE studentid = $1`, [studentId]);
+    await client.query(`DELETE FROM malpractice_logs WHERE studentid = $1`, [studentId]);
+    await client.query(`DELETE FROM student_exams WHERE studentid = $1`, [studentId]);
+    await client.query(`DELETE FROM student_courses WHERE studentid = $1`, [studentId]);
+    await client.query(`DELETE FROM student_history WHERE studentid = $1`, [studentId]);
+
+    const deleteResult = await client.query(`DELETE FROM students WHERE id = $1 RETURNING id`, [studentId]);
+
+    if (deleteResult.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    await client.query('COMMIT');
+    res.json({ message: 'Student and associated records deleted', id: studentId });
+  } catch (err) {
+    if (client) {
+      await client.query('ROLLBACK');
+    }
+    console.error('Database error deleting student:', err.stack);
+    return res.status(400).json({ error: `Failed to delete student: ${err.message}` });
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
+});
+
+// Bulk upload preview
 router.post('/bulk-upload/preview', singleFileUpload, async (req, res) => {
   console.log('Received POST /api/student/bulk-upload/preview at', new Date().toISOString(), 'with file:', req.file);
   if (!req.file) {
@@ -225,19 +267,25 @@ router.post('/bulk-upload/preview', singleFileUpload, async (req, res) => {
         name: String(row['Student Name'] || ''),
         registerNo: cleanNumber(row['Register No']) || '',
         dob: dob,
-        password: dob,
+        password: dob || '',
         aadharNumber: cleanNumber(row['Aadhar Number']) || null,
         abcId: cleanNumber(row['ABC ID']) || null,
-        photo: null, // Not included in bulk upload
-        eSignature: null, // Not included in bulk upload
+        photo: null,
+        eSignature: null,
         source: 'upload',
       };
     });
 
-    const invalidRows = students.filter((s) => !s.name || !s.registerNo || !s.dob || !isValidDOB(s.dob));
+    const invalidRows = students.filter((s) => !s.name || !s.registerNo);
     if (invalidRows.length > 0) {
       return res.status(400).json({
-        error: 'Some rows are missing required fields or DOB is not 8 digits (e.g., 28022025 or 12345678)',
+        error: 'Some rows are missing required fields (name or registerNo)',
+      });
+    }
+    const invalidDOBs = students.filter((s) => s.dob && !isValidDOB(s.dob));
+    if (invalidDOBs.length > 0) {
+      return res.status(400).json({
+        error: 'Some rows have invalid DOB format (must be 8 digits, e.g., 28042005)',
       });
     }
 
@@ -254,127 +302,88 @@ router.post('/bulk-upload/preview', singleFileUpload, async (req, res) => {
   }
 });
 
-router.post('/bulk-upload/confirm', (req, res) => {
+// Bulk upload confirm
+router.post('/bulk-upload/confirm', async (req, res) => {
   console.log('Received POST /api/student/bulk-upload/confirm at', new Date().toISOString(), 'with body:', req.body);
   const { userType, userId, students } = req.body;
   if (!students || !Array.isArray(students)) {
     return res.status(400).json({ error: 'Students array is required' });
   }
 
+  let client;
   try {
-    db.serialize(() => {
-      db.run('BEGIN TRANSACTION');
-      const stmt = db.prepare(
-        `INSERT INTO students (name, registerNo, dob, password, aadharNumber, abcId, photo, eSignature, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      );
-      const historyStmt = db.prepare(
-        `INSERT INTO student_history (studentId, action, userType, userId, timestamp) VALUES (?, ?, ?, ?, ?)`
-      );
+    client = await pgPool.connect();
+    await client.query('BEGIN');
 
-      let completedOperations = 0;
-      let totalOperations = students.length;
-      let errorOccurred = false;
-
-      students.forEach((s) => {
-        if (!s.dob || !isValidDOB(s.dob)) {
-          console.error(`Invalid DOB for student ${s.name}: ${s.dob}`);
-          errorOccurred = true;
-          completedOperations++;
-          if (completedOperations === totalOperations) {
-            finalizeStatements();
-          }
-          return;
-        }
-
-        stmt.run(
-          [
-            s.name,
-            s.registerNo,
-            s.dob,
-            s.password,
-            s.aadharNumber || null,
-            s.abcId || null,
-            s.photo || null,
-            s.eSignature || null,
-            s.source,
-          ],
-          function (err) {
-            if (err) {
-              console.error('Error inserting student:', err.stack);
-              errorOccurred = true;
-              completedOperations++;
-              if (completedOperations === totalOperations) {
-                finalizeStatements();
-              }
-              return;
-            }
-            const studentId = this.lastID;
-            historyStmt.run([studentId, 'created', userType, userId, getISTTimestamp()], (err) => {
-              if (err) {
-                console.error('Error inserting student history:', err.stack);
-                errorOccurred = true;
-              }
-              completedOperations++;
-              if (completedOperations === totalOperations) {
-                finalizeStatements();
-              }
-            });
-          }
-        );
-      });
-
-      function finalizeStatements() {
-        stmt.finalize((err) => {
-          if (err) console.error('Error finalizing student statement:', err.stack);
-          historyStmt.finalize((err) => {
-            if (err) console.error('Error finalizing history statement:', err.stack);
-            if (errorOccurred) {
-              db.run('ROLLBACK', (err) => {
-                if (err) console.error('Error rolling back transaction:', err.stack);
-                res.status(400).json({ error: 'Failed to upload some students' });
-              });
-            } else {
-              db.run('COMMIT', (err) => {
-                if (err) {
-                  console.error('Error committing transaction:', err.stack);
-                  res.status(400).json({ error: 'Failed to commit transaction' });
-                } else {
-                  res.json({ message: `${students.length} students uploaded successfully` });
-                }
-              });
-            }
-          });
-        });
+    for (const s of students) {
+      if (!s.name || !s.registerNo) {
+        throw new Error(`Missing required fields for student ${s.name || 'unknown'}`);
       }
-    });
+      if (s.dob && !isValidDOB(s.dob)) {
+        throw new Error(`Invalid DOB for student ${s.name}: ${s.dob}`);
+      }
+
+      const studentResult = await client.query(
+        `INSERT INTO students (name, registerNo, dob, password, aadharNumber, abcId, photo, esignature, source) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+        [
+          s.name,
+          s.registerNo,
+          s.dob || null,
+          s.password || '',
+          s.aadharNumber || null,
+          s.abcId || null,
+          s.photo || null,
+          s.eSignature || null,
+          s.source,
+        ]
+      );
+      const studentId = studentResult.rows[0].id;
+
+      await client.query(
+        `INSERT INTO student_history (studentid, action, usertype, userid, timestamp) VALUES ($1, $2, $3, $4, $5)`,
+        [studentId, 'created', userType, userId, getISTTimestamp()]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ message: `${students.length} students uploaded successfully` });
   } catch (error) {
-    db.run('ROLLBACK');
+    if (client) {
+      await client.query('ROLLBACK');
+    }
     console.error('Error saving students:', error.stack);
-    res.status(500).json({ error: 'Failed to save students' });
+    res.status(500).json({ error: `Failed to save students: ${error.message}` });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 });
 
-// Student courses routes
-router.get('/student-courses/:studentId', (req, res) => {
+// Fetch student courses
+router.get('/student-courses/:studentId', async (req, res) => {
   console.log('Received GET /api/student/student-courses/:studentId at', new Date().toISOString(), 'with params:', req.params);
   const studentId = req.params.studentId;
-  db.all(
-    `SELECT c.id, c.name, c.course_code, c.learning_platform, c.examDate, c.examTime, c.examQuestionCount, c.examMarks, c.coCount, c.coDetails, c.isDraft, c.isRegistrationOpen
-     FROM student_courses sc
-     JOIN courses c ON sc.courseId = c.id
-     WHERE sc.studentId = ?`,
-    [studentId],
-    (err, rows) => {
-      if (err) {
-        console.error('Database error fetching student courses:', err.stack);
-        return res.status(500).json({ error: `Database error fetching student courses: ${err.message}` });
-      }
-      console.log('Assigned courses fetched:', rows);
-      res.json(rows || []);
-    }
-  );
+  try {
+    const { rows } = await pgPool.query(
+      `SELECT c.id, c.name, c.course_code, c.learning_platform, c.examdate, c.examtime, c.examquestioncount, c.exammarks, c.cocount, c.codetails, c.isdraft, c.isregistrationopen,
+              s.registerNo, s.name AS student_name
+       FROM student_courses sc
+       JOIN courses c ON sc.courseid = c.id
+       JOIN students s ON sc.studentid = s.id
+       WHERE sc.studentid = $1`,
+      [studentId]
+    );
+    console.log('Assigned courses fetched:', rows);
+    res.json(rows || []);
+  } catch (err) {
+    console.error('Database error fetching student courses:', err.stack);
+    return res.status(500).json({ error: `Database error fetching student courses: ${err.message}` });
+  }
 });
 
+// Assign a single course to a student
 router.post('/student-courses/single', async (req, res) => {
   console.log('Received POST /api/student/student-courses/single at', new Date().toISOString(), 'with body:', req.body);
   const { studentId, courseId, userType, userId } = req.body;
@@ -389,86 +398,70 @@ router.post('/student-courses/single', async (req, res) => {
     return res.status(400).json({ error: 'Student ID, Course ID, and User ID must be valid numbers' });
   }
 
+  let client;
   try {
-    const student = await new Promise((resolve, reject) => {
-      db.get(`SELECT id, name, registerNo, dob FROM students WHERE id = ?`, [studentId], (err, row) => {
-        if (err) reject(err);
-        resolve(row);
-      });
-    });
-    if (!student) {
+    client = await pgPool.connect();
+    await client.query('BEGIN');
+
+    // Verify student exists
+    const studentResult = await client.query(
+      `SELECT id FROM students WHERE id = $1`,
+      [studentId]
+    );
+    if (studentResult.rows.length === 0) {
       console.log(`Student not found: ${studentId}`);
+      await client.query('ROLLBACK');
       return res.status(400).json({ error: `Student with ID ${studentId} does not exist` });
     }
-    if (!student.name || !student.registerNo || !student.dob || !isValidDOB(student.dob)) {
-      console.log(`Student ${studentId} has invalid details:`, student);
-      return res.status(400).json({ error: 'Student record is missing required fields or has invalid DOB' });
-    }
 
-    const course = await new Promise((resolve, reject) => {
-      db.get(`SELECT id FROM courses WHERE id = ?`, [courseId], (err, row) => {
-        if (err) reject(err);
-        resolve(row);
-      });
-    });
-    if (!course) {
+    // Verify course exists
+    const courseResult = await client.query(`SELECT id FROM courses WHERE id = $1`, [courseId]);
+    if (courseResult.rows.length === 0) {
       console.log(`Course not found: ${courseId}`);
+      await client.query('ROLLBACK');
       return res.status(400).json({ error: `Course with ID ${courseId} does not exist` });
     }
 
-    const existingAssignment = await new Promise((resolve, reject) => {
-      db.get(
-        `SELECT id FROM student_courses WHERE studentId = ? AND courseId = ?`,
-        [studentId, courseId],
-        (err, row) => {
-          if (err) reject(err);
-          resolve(row);
-        }
-      );
-    });
-    if (existingAssignment) {
+    // Check for existing assignment
+    const existingAssignmentResult = await client.query(
+      `SELECT id FROM student_courses WHERE studentid = $1 AND courseid = $2`,
+      [studentId, courseId]
+    );
+    if (existingAssignmentResult.rows.length > 0) {
       console.log(`Assignment exists: studentId=${studentId}, courseId=${courseId}`);
+      await client.query('ROLLBACK');
       return res.status(400).json({ error: `Course ${courseId} is already assigned to student ${studentId}` });
     }
 
-    await new Promise((resolve, reject) => {
-      db.run(
-        `INSERT INTO student_courses (studentId, courseId, startDate, startTime) VALUES (?, ?, ?, ?)`,
-        [studentId, courseId, new Date().toISOString().split('T')[0], new Date().toISOString().split('T')[1].split('.')[0]],
-        function (err) {
-          if (err) {
-            console.error('Database error assigning course to student:', err.stack);
-            reject(new Error(`Failed to assign course: ${err.message}`));
-          } else {
-            resolve();
-          }
-        }
-      );
-    });
+    // Assign course
+    await client.query(
+      `INSERT INTO student_courses (studentid, courseid, startdate, starttime, isEligible, paymentConfirmed) 
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [studentId, courseId, new Date().toISOString().split('T')[0], new Date().toISOString().split('T')[1].split('.')[0], false, false]
+    );
 
-    await new Promise((resolve, reject) => {
-      db.run(
-        `INSERT INTO student_history (studentId, action, userType, userId, timestamp) VALUES (?, ?, ?, ?, ?)`,
-        [studentId, `assigned_course_${courseId}`, userType, userId, getISTTimestamp()],
-        (err) => {
-          if (err) {
-            console.error('Database error logging student history:', err.stack);
-            reject(new Error(`Failed to log student history: ${err.message}`));
-          } else {
-            resolve();
-          }
-        }
-      );
-    });
+    await client.query(
+      `INSERT INTO student_history (studentid, action, usertype, userid, timestamp) VALUES ($1, $2, $3, $4, $5)`,
+      [studentId, `assigned_course_${courseId}`, userType, userId, getISTTimestamp()]
+    );
 
-    console.log(`Course ${courseId} assigned to student ${studentId} (${student.name})`);
+    await client.query('COMMIT');
+    console.log(`Course ${courseId} assigned to student ${studentId}`);
     res.json({ message: 'Course assigned to student' });
   } catch (error) {
+    if (client) {
+      await client.query('ROLLBACK');
+    }
     console.error('Error in /api/student/student-courses/single:', error.stack);
     res.status(500).json({ error: `Failed to assign course: ${error.message}` });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 });
 
+// Bulk assign courses
 router.post('/student-courses/bulk', async (req, res) => {
   console.log('Received POST /api/student/student-courses/bulk at', new Date().toISOString(), 'with body:', req.body);
   const { assignments, userType, userId } = req.body;
@@ -482,7 +475,11 @@ router.post('/student-courses/bulk', async (req, res) => {
     return res.status(400).json({ error: 'User Type and User ID are required, and User ID must be a number' });
   }
 
+  let client;
   try {
+    client = await pgPool.connect();
+    await client.query('BEGIN');
+
     const validAssignments = [];
     const errors = [];
 
@@ -492,43 +489,26 @@ router.post('/student-courses/bulk', async (req, res) => {
         continue;
       }
 
-      const student = await new Promise((resolve, reject) => {
-        db.get(`SELECT id, name, registerNo, dob FROM students WHERE id = ?`, [studentId], (err, row) => {
-          if (err) reject(err);
-          resolve(row);
-        });
-      });
-      if (!student) {
+      const studentResult = await client.query(
+        `SELECT id FROM students WHERE id = $1`,
+        [studentId]
+      );
+      if (studentResult.rows.length === 0) {
         errors.push(`Student with ID ${studentId} does not exist`);
         continue;
       }
-      if (!student.name || !student.registerNo || !student.dob || !isValidDOB(student.dob)) {
-        errors.push(`Student ${studentId} has invalid details`);
-        continue;
-      }
 
-      const course = await new Promise((resolve, reject) => {
-        db.get(`SELECT id FROM courses WHERE id = ?`, [courseId], (err, row) => {
-          if (err) reject(err);
-          resolve(row);
-        });
-      });
-      if (!course) {
+      const courseResult = await client.query(`SELECT id FROM courses WHERE id = $1`, [courseId]);
+      if (courseResult.rows.length === 0) {
         errors.push(`Course with ID ${courseId} does not exist`);
         continue;
       }
 
-      const existingAssignment = await new Promise((resolve, reject) => {
-        db.get(
-          `SELECT id FROM student_courses WHERE studentId = ? AND courseId = ?`,
-          [studentId, courseId],
-          (err, row) => {
-            if (err) reject(err);
-            resolve(row);
-          }
-        );
-      });
-      if (existingAssignment) {
+      const existingAssignmentResult = await client.query(
+        `SELECT id FROM student_courses WHERE studentid = $1 AND courseid = $2`,
+        [studentId, courseId]
+      );
+      if (existingAssignmentResult.rows.length > 0) {
         errors.push(`Course ${courseId} is already assigned to student ${studentId}`);
         continue;
       }
@@ -538,192 +518,130 @@ router.post('/student-courses/bulk', async (req, res) => {
 
     if (validAssignments.length === 0) {
       console.log('No valid assignments to process:', errors);
+      await client.query('ROLLBACK');
       return res.status(400).json({ error: 'No valid assignments to process', details: errors });
     }
 
-    db.serialize(() => {
-      db.run('BEGIN TRANSACTION');
-      const stmt = db.prepare(
-        `INSERT INTO student_courses (studentId, courseId, startDate, startTime) VALUES (?, ?, ?, ?)`
-      );
-      const historyStmt = db.prepare(
-        `INSERT INTO student_history (studentId, action, userType, userId, timestamp) VALUES (?, ?, ?, ?, ?)`
+    for (const { studentId, courseId } of validAssignments) {
+      await client.query(
+        `INSERT INTO student_courses (studentid, courseid, startdate, starttime, isEligible, paymentConfirmed) 
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [studentId, courseId, new Date().toISOString().split('T')[0], new Date().toISOString().split('T')[1].split('.')[0], false, false]
       );
 
-      let completedOperations = 0;
-      let totalOperations = validAssignments.length;
-      let errorOccurred = false;
-
-      validAssignments.forEach(({ studentId, courseId }) => {
-        stmt.run(
-          [studentId, courseId, new Date().toISOString().split('T')[0], new Date().toISOString().split('T')[1].split('.')[0]],
-          function (err) {
-            if (err) {
-              console.error(`Error assigning course ${courseId} to student ${studentId}:`, err.stack);
-              errorOccurred = true;
-              completedOperations++;
-              if (completedOperations === totalOperations) {
-                finalizeStatements();
-              }
-              return;
-            }
-            historyStmt.run([studentId, `assigned_course_${courseId}`, userType, userId, getISTTimestamp()], (err) => {
-              if (err) {
-                console.error(`Error logging history for student ${studentId}, course ${courseId}:`, err.stack);
-                errorOccurred = true;
-              }
-              completedOperations++;
-              if (completedOperations === totalOperations) {
-                finalizeStatements();
-              }
-            });
-          }
-        );
-      });
-
-      function finalizeStatements() {
-        stmt.finalize((err) => {
-          if (err) console.error('Error finalizing student_courses statement:', err.stack);
-          historyStmt.finalize((err) => {
-            if (err) console.error('Error finalizing history statement:', err.stack);
-            if (errorOccurred) {
-              db.run('ROLLBACK', (err) => {
-                if (err) console.error('Error rolling back transaction:', err.stack);
-                res.status(400).json({ error: 'Failed to assign some courses', details: errors });
-              });
-            } else {
-              db.run('COMMIT', (err) => {
-                if (err) {
-                  console.error('Error committing transaction:', err.stack);
-                  res.status(400).json({ error: 'Failed to commit transaction', details: errors });
-                } else {
-                  console.log(`Assigned ${validAssignments.length} courses successfully`);
-                  res.json({
-                    message: `${validAssignments.length} courses assigned successfully`,
-                    skipped: errors
-                  });
-                }
-              });
-            }
-          });
-        });
-      }
-    });
-  } catch (error) {
-    console.error('Error in /api/student/student-courses/bulk:', error.stack);
-    db.run('ROLLBACK');
-    res.status(500).json({ error: `Failed to assign courses: ${error.message}` });
-  }
-});
-
-router.delete('/student-courses', (req, res) => {
-  console.log('Received DELETE /api/student/student-courses at', new Date().toISOString(), 'with body:', req.body);
-  const { studentId, courseId, userType, userId } = req.body;
-  if (!studentId || !courseId) {
-    console.log('Missing studentId or courseId');
-    return res.status(400).json({ error: 'Student ID and Course ID are required' });
-  }
-
-  db.run(
-    `DELETE FROM student_courses WHERE studentId = ? AND courseId = ?`,
-    [studentId, courseId],
-    function (err) {
-      if (err) {
-        console.error('Database error unassigning course from student:', err.stack);
-        return res.status(400).json({ error: `Failed to unassign course: ${err.message}` });
-      }
-      if (this.changes === 0) {
-        console.log(`No course assignment found for studentId: ${studentId}, courseId: ${courseId}`);
-        return res.status(404).json({ error: 'Course assignment not found' });
-      }
-      db.run(
-        `INSERT INTO student_history (studentId, action, userType, userId, timestamp) VALUES (?, ?, ?, ?, ?)`,
-        [studentId, `unassigned_course_${courseId}`, userType, userId, getISTTimestamp()],
-        (err) => {
-          if (err) {
-            console.error('Database error logging student history:', err.stack);
-            return res.status(400).json({ error: `Failed to log student history: ${err.message}` });
-          }
-          console.log('Course unassigned successfully');
-          res.json({ message: 'Course unassigned from student' });
-        }
+      await client.query(
+        `INSERT INTO student_history (studentid, action, usertype, userid, timestamp) VALUES ($1, $2, $3, $4, $5)`,
+        [studentId, `assigned_course_${courseId}`, userType, userId, getISTTimestamp()]
       );
     }
-  );
+
+    await client.query('COMMIT');
+    console.log(`Assigned ${validAssignments.length} courses successfully`);
+    res.json({
+      message: `${validAssignments.length} courses assigned successfully`,
+      skipped: errors
+    });
+  } catch (error) {
+    if (client) {
+      await client.query('ROLLBACK');
+    }
+    console.error('Error in /api/student/student-courses/bulk:', error.stack);
+    res.status(500).json({ error: `Failed to assign courses: ${error.message}`, details: errors });
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
 });
 
-// Bulk delete route
-router.post('/bulk-delete', (req, res) => {
+// Unassign a course from a student
+router.delete('/student-courses/unassign', async (req, res) => {
+  console.log('Received DELETE /api/student/student-courses/unassign at', new Date().toISOString(), 'with body:', req.body);
+  const { studentId, courseId, userType, userId } = req.body;
+  if (!studentId || !courseId || !userType || !userId) {
+    console.log('Missing required fields:', { studentId, courseId, userType, userId });
+    return res.status(400).json({ error: 'Student ID, Course ID, User Type, and User ID are required' });
+  }
+
+  let client;
+  try {
+    client = await pgPool.connect();
+    await client.query('BEGIN');
+
+    const deleteResult = await client.query(
+      `DELETE FROM student_courses WHERE studentid = $1 AND courseid = $2`,
+      [studentId, courseId]
+    );
+    if (deleteResult.rowCount === 0) {
+      console.log(`No course assignment found for studentId: ${studentId}, courseId: ${courseId}`);
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Course assignment not found' });
+    }
+
+    await client.query(
+      `INSERT INTO student_history (studentid, action, usertype, userid, timestamp) VALUES ($1, $2, $3, $4, $5)`,
+      [studentId, `unassigned_course_${courseId}`, userType, userId, getISTTimestamp()]
+    );
+
+    await client.query('COMMIT');
+    console.log('Course unassigned successfully');
+    res.json({ message: 'Course unassigned from student' });
+  } catch (err) {
+    if (client) {
+      await client.query('ROLLBACK');
+    }
+    console.error('Database error unassigning course from student:', err.stack);
+    return res.status(500).json({ error: `Failed to unassign course: ${err.message}` });
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
+});
+
+// Bulk delete students
+router.post('/bulk-delete', async (req, res) => {
   console.log('Received POST /api/student/bulk-delete at', new Date().toISOString(), 'with body:', req.body);
   const { studentIds, userType, userId } = req.body;
   if (!studentIds || !Array.isArray(studentIds) || studentIds.length === 0) {
     return res.status(400).json({ error: 'Student IDs array is required and must not be empty' });
   }
 
+  let client;
   try {
-    db.serialize(() => {
-      db.run('BEGIN TRANSACTION');
-      const deleteStmt = db.prepare(`DELETE FROM students WHERE id = ?`);
-      const historyStmt = db.prepare(
-        `INSERT INTO student_history (studentId, action, userType, userId, timestamp) VALUES (?, ?, ?, ?, ?)`
+    client = await pgPool.connect();
+    await client.query('BEGIN');
+
+    for (const studentId of studentIds) {
+      await client.query(
+        `INSERT INTO student_history (studentid, action, usertype, userid, timestamp) VALUES ($1, $2, $3, $4, $5)`,
+        [studentId, 'deleted', userType, userId, getISTTimestamp()]
       );
+    }
 
-      let completedOperations = 0;
-      let totalOperations = studentIds.length;
-      let errorOccurred = false;
+    await client.query(`DELETE FROM student_results WHERE studentid = ANY($1::integer[])`, [studentIds]);
+    await client.query(`DELETE FROM malpractice_logs WHERE studentid = ANY($1::integer[])`, [studentIds]);
+    await client.query(`DELETE FROM student_exams WHERE studentid = ANY($1::integer[])`, [studentIds]);
+    await client.query(`DELETE FROM student_courses WHERE studentid = ANY($1::integer[])`, [studentIds]);
+    await client.query(`DELETE FROM student_history WHERE studentid = ANY($1::integer[])`, [studentIds]);
 
-      studentIds.forEach((studentId) => {
-        deleteStmt.run([studentId], function (err) {
-          if (err) {
-            console.error(`Error deleting student ${studentId}:`, err.stack);
-            errorOccurred = true;
-            completedOperations++;
-            if (completedOperations === totalOperations) {
-              finalizeStatements();
-            }
-            return;
-          }
-          historyStmt.run([studentId, 'deleted', userType, userId, getISTTimestamp()], (err) => {
-            if (err) {
-              console.error(`Error logging history for student ${studentId}:`, err.stack);
-              errorOccurred = true;
-            }
-            completedOperations++;
-            if (completedOperations === totalOperations) {
-              finalizeStatements();
-            }
-          });
-        });
-      });
+    const deleteResult = await client.query(
+      `DELETE FROM students WHERE id = ANY($1::integer[]) RETURNING id`,
+      [studentIds]
+    );
 
-      function finalizeStatements() {
-        deleteStmt.finalize((err) => {
-          if (err) console.error('Error finalizing delete statement:', err.stack);
-          historyStmt.finalize((err) => {
-            if (err) console.error('Error finalizing history statement:', err.stack);
-            if (errorOccurred) {
-              db.run('ROLLBACK', (err) => {
-                if (err) console.error('Error rolling back transaction:', err.stack);
-                res.status(400).json({ error: 'Failed to delete some students' });
-              });
-            } else {
-              db.run('COMMIT', (err) => {
-                if (err) {
-                  console.error('Error committing transaction:', err.stack);
-                  res.status(400).json({ error: 'Failed to commit transaction' });
-                } else {
-                  res.json({ message: `${studentIds.length} students deleted successfully` });
-                }
-              });
-            }
-          });
-        });
-      }
-    });
+    await client.query('COMMIT');
+    res.json({ message: `${deleteResult.rowCount} students and associated records deleted successfully` });
   } catch (error) {
-    db.run('ROLLBACK');
+    if (client) {
+      await client.query('ROLLBACK');
+    }
     console.error('Error deleting students:', error.stack);
-    res.status(500).json({ error: 'Failed to delete students' });
+    res.status(500).json({ error: `Failed to delete students: ${error.message}` });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 });
 

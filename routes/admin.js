@@ -1,22 +1,22 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../model');
+const pgPool = require('../model');
 const bcrypt = require('bcrypt');
 
-router.get('/test-db', (req, res) => {
+router.get('/test-db', async (req, res) => {
   console.log('Received request to /test-db');
-  db.get(`SELECT * FROM admins WHERE username = ?`, ['master'], (err, row) => {
-    if (err) {
-      console.error('Database error:', err.message);
-      return res.status(500).json({ error: 'Database error', details: err.message });
-    }
-    if (!row) {
+  try {
+    const { rows } = await pgPool.query('SELECT * FROM admins WHERE username = $1', ['master']);
+    if (rows.length === 0) {
       console.log('No admin found for username: master');
       return res.status(404).json({ error: 'No admin found' });
     }
-    console.log('Admin found:', row);
-    res.json(row);
-  });
+    console.log('Admin found:', rows[0]);
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Database error:', err.message);
+    return res.status(500).json({ error: 'Database error', details: err.message });
+  }
 });
 
 router.post('/login', async (req, res) => {
@@ -29,44 +29,39 @@ router.post('/login', async (req, res) => {
   }
 
   try {
-    db.get(`SELECT * FROM admins WHERE username = ?`, [username], async (err, row) => {
-      if (err) {
-        console.error('Database error during admin login:', err.message);
-        return res.status(500).json({ error: `Internal server error: ${err.message}` });
-      }
+    const { rows } = await pgPool.query('SELECT * FROM admins WHERE username = $1', [username]);
+    if (rows.length === 0) {
+      console.log('No admin found for username:', username);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
-      if (!row) {
-        console.log('No admin found for username:', username);
-        return res.status(401).json({ error: 'Invalid credentials' });
-      }
+    const admin = rows[0];
+    console.log('Found admin:', { id: admin.id, username: admin.username, password: admin.password, ismaster: admin.ismaster });
 
-      console.log('Found admin:', { id: row.id, username: row.username, password: row.password, isMaster: row.isMaster });
+    const isHashed = admin.password && admin.password.startsWith('$2b$');
+    let isPasswordValid;
 
-      const isHashed = row.password && row.password.startsWith('$2b$');
-      let isPasswordValid;
+    if (isHashed) {
+      console.log('Comparing hashed password...');
+      isPasswordValid = await bcrypt.compare(password, admin.password);
+    } else {
+      console.warn('Using plain text password comparison (insecure)');
+      isPasswordValid = password === admin.password;
+    }
 
-      if (isHashed) {
-        console.log('Comparing hashed password...');
-        isPasswordValid = await bcrypt.compare(password, row.password);
-      } else {
-        console.warn('Using plain text password comparison (insecure)');
-        isPasswordValid = password === row.password;
-      }
+    if (!isPasswordValid) {
+      console.log('Password mismatch for admin:', username);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
-      if (!isPasswordValid) {
-        console.log('Password mismatch for admin:', username);
-        return res.status(401).json({ error: 'Invalid credentials' });
-      }
+    const isMaster = admin.ismaster === undefined ? false : admin.ismaster;
+    console.log('Admin login successful:', { id: admin.id, username: admin.username, isMaster });
 
-      const isMaster = row.isMaster === undefined ? 0 : row.isMaster === 1;
-      console.log('Admin login successful:', { id: row.id, username: row.username, isMaster });
-
-      res.json({
-        id: row.id,
-        username: row.username,
-        isMaster,
-        role: 'admin',
-      });
+    res.json({
+      id: admin.id,
+      username: admin.username,
+      isMaster,
+      role: 'admin',
     });
   } catch (err) {
     console.error('Unexpected error during admin login:', err.message);
@@ -74,7 +69,7 @@ router.post('/login', async (req, res) => {
   }
 });
 
-router.post('/staff/login', (req, res) => {
+router.post('/staff/login', async (req, res) => {
   const { username, password } = req.body;
   console.log('Staff login attempt:', { username, password });
 
@@ -83,23 +78,23 @@ router.post('/staff/login', (req, res) => {
     return res.status(400).json({ error: 'Username and password are required' });
   }
 
-  db.get(`SELECT * FROM staff WHERE username = ? AND password = ?`, [username, password], (err, row) => {
-    if (err) {
-      console.error('Database error during staff login:', err.message);
-      return res.status(500).json({ error: `Internal server error: ${err.message}` });
-    }
-
-    if (!row) {
+  try {
+    const { rows } = await pgPool.query('SELECT * FROM staff WHERE username = $1 AND password = $2', [username, password]);
+    if (rows.length === 0) {
       console.log('No staff found for username:', username);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    console.log('Staff login successful:', { id: row.id, username: row.username });
-    res.json({ id: row.id, username: row.username, role: 'staff' });
-  });
+    const staff = rows[0];
+    console.log('Staff login successful:', { id: staff.id, username: staff.username });
+    res.json({ id: staff.id, username: staff.username, role: 'staff' });
+  } catch (err) {
+    console.error('Database error during staff login:', err.message);
+    return res.status(500).json({ error: `Internal server error: ${err.message}` });
+  }
 });
 
-router.post('/student/login', (req, res) => {
+router.post('/student/login', async (req, res) => {
   const { registerNo, password } = req.body;
   console.log('Student login attempt:', { registerNo, password });
 
@@ -108,20 +103,20 @@ router.post('/student/login', (req, res) => {
     return res.status(400).json({ error: 'registerNo and password are required' });
   }
 
-  db.get(`SELECT * FROM students WHERE registerNo = ? AND password = ?`, [registerNo, password], (err, row) => {
-    if (err) {
-      console.error('Database error during student login:', err.message);
-      return res.status(500).json({ error: `Internal server error: ${err.message}` });
-    }
-
-    if (!row) {
+  try {
+    const { rows } = await pgPool.query('SELECT * FROM students WHERE registerNo = $1 AND password = $2', [registerNo, password]);
+    if (rows.length === 0) {
       console.log('No student found for registerNo:', registerNo);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    console.log('Student login successful:', { id: row.id, registerNo: row.registerNo });
-    res.json({ id: row.id, registerNo: row.registerNo, name: row.name, role: 'student' });
-  });
+    const student = rows[0];
+    console.log('Student login successful:', { id: student.id, registerNo: student.registerNo });
+    res.json({ id: student.id, registerNo: student.registerNo, name: student.name, role: 'student' });
+  } catch (err) {
+    console.error('Database error during student login:', err.message);
+    return res.status(500).json({ error: `Internal server error: ${err.message}` });
+  }
 });
 
 module.exports = router;

@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../model');
+const pgPool = require('../model');
 const { getISTTimestamp } = require('../utils/helpers');
 const upload = require('../utils/multer');
 const XLSX = require('xlsx');
@@ -18,21 +18,60 @@ const authMiddleware = (req, res, next) => {
   next();
 };
 
-// GET questions for a course
-router.get('/:courseId', (req, res) => {
-  console.log(`Fetching questions for courseId: ${req.params.courseId}`);
-  db.all(`SELECT * FROM questions WHERE courseId = ?`, [req.params.courseId], (err, rows) => {
-    if (err) {
-      console.error('Database error fetching questions:', err.message);
-      return res.status(500).json({ error: `Internal server error: ${err.message}` });
+// GET COs for a course
+router.get('/:courseId/cos', async (req, res) => {
+  console.log(`Fetching COs for courseId: ${req.params.courseId}`);
+  try {
+    const { rows } = await pgPool.query(
+      `SELECT codetails, cocount FROM courses WHERE id = $1`,
+      [req.params.courseId]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Course not found' });
     }
+
+    const { codetails, cocount } = rows[0];
+    let coDetails;
+    try {
+      coDetails = codetails ? JSON.parse(codetails) : [];
+    } catch (err) {
+      console.error('Error parsing codetails JSON:', err.message);
+      return res.status(500).json({ error: 'Invalid CO details format in course' });
+    }
+
+    if (!Array.isArray(coDetails) || coDetails.length !== cocount) {
+      console.warn(`CO count mismatch for courseId: ${req.params.courseId}, cocount: ${cocount}, codetails length: ${coDetails.length}`);
+    }
+
+    res.json({
+      coCount: cocount || 0,
+      coDetails: coDetails.map(co => ({
+        coNumber: co.coNumber,
+        coDescription: co.coDescription,
+        kLevel: co.kLevel
+      }))
+    });
+  } catch (err) {
+    console.error('Database error fetching COs:', err.message);
+    return res.status(500).json({ error: `Internal server error: ${err.message}` });
+  }
+});
+
+// GET questions for a course
+router.get('/:courseId', async (req, res) => {
+  console.log(`Fetching questions for courseId: ${req.params.courseId}`);
+  try {
+    const { rows } = await pgPool.query(`SELECT * FROM questions WHERE courseid = $1`, [req.params.courseId]);
     console.log('Questions fetched:', rows);
     res.json(rows || []);
-  });
+  } catch (err) {
+    console.error('Database error fetching questions:', err.message);
+    return res.status(500).json({ error: `Internal server error: ${err.message}` });
+  }
 });
 
 // POST create a new question with optional images
-router.post('/', upload, (req, res) => {
+router.post('/', upload, async (req, res) => {
   console.log('Creating question:', req.body, req.files);
   const { courseId, coNumber, kLevel, question, option1, option2, option3, option4, answer, weightage, userType, userId } = req.body;
   if (!courseId || !coNumber || !kLevel || !question || !option1 || !option2 || !option3 || !option4 || !answer) {
@@ -45,14 +84,18 @@ router.post('/', upload, (req, res) => {
     return res.status(400).json({ error: `Invalid answer: ${answer}. Must be one of: ${validAnswers.join(', ')}` });
   }
 
-  // Validate kLevel against course's coDetails
-  db.get(`SELECT coDetails FROM courses WHERE id = ?`, [courseId], (err, row) => {
-    if (err) return res.status(500).json({ error: `Database error: ${err.message}` });
-    if (!row) return res.status(404).json({ error: 'Course not found' });
+  try {
+    // Validate kLevel against course's coDetails
+    const courseResult = await pgPool.query(`SELECT codetails FROM courses WHERE id = $1`, [courseId]);
+    if (courseResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Course not found' });
+    }
 
-    const coDetails = JSON.parse(row.coDetails);
+    const coDetails = JSON.parse(courseResult.rows[0].codetails || '[]');
     const selectedCO = coDetails.find(co => co.coNumber === coNumber);
-    if (!selectedCO) return res.status(400).json({ error: `CO ${coNumber} not found in course` });
+    if (!selectedCO) {
+      return res.status(400).json({ error: `CO ${coNumber} not found in course` });
+    }
     if (kLevel < 1 || kLevel > 14 || kLevel > selectedCO.kLevel) {
       return res.status(400).json({ error: `K-Level must be between 1 and ${selectedCO.kLevel} for CO ${coNumber}` });
     }
@@ -64,34 +107,28 @@ router.post('/', upload, (req, res) => {
     const option3Image = req.files.option3Image ? req.files.option3Image[0].path : null;
     const option4Image = req.files.option4Image ? req.files.option4Image[0].path : null;
 
-    db.run(
-      `INSERT INTO questions (courseId, coNumber, kLevel, question, questionImage, option1, option1Image, option2, option2Image, option3, option3Image, option4, option4Image, answer, weightage) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [courseId, coNumber, kLevel, question, questionImage, option1, option1Image, option2, option2Image, option3, option3Image, option4, option4Image, answer, weightage || 1],
-      function (err) {
-        if (err) {
-          console.error('Database error creating question:', err.message);
-          return res.status(400).json({ error: `Failed to create question: ${err.message}` });
-        }
-        const questionId = this.lastID;
-        db.run(
-          `INSERT INTO course_history (courseId, action, questionId, userType, userId, timestamp) VALUES (?, ?, ?, ?, ?, ?)`,
-          [courseId, 'added', questionId, userType, userId, getISTTimestamp()],
-          (err) => {
-            if (err) {
-              console.error('Database error creating course history:', err.message);
-              return res.status(400).json({ error: `Failed to log history: ${err.message}` });
-            }
-            res.json({ message: 'Question created', questionId });
-          }
-        );
-      }
+    const questionResult = await pgPool.query(
+      `INSERT INTO questions (courseid, conumber, klevel, question, questionimage, option1, option1image, option2, option2image, option3, option3image, option4, option4image, answer, weightage) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+       RETURNING id`,
+      [courseId, coNumber, kLevel, question, questionImage, option1, option1Image, option2, option2Image, option3, option3Image, option4, option4Image, answer, weightage || 1]
     );
-  });
+    const questionId = questionResult.rows[0].id;
+
+    await pgPool.query(
+      `INSERT INTO course_history (courseid, action, questionid, usertype, userid, timestamp) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [courseId, 'added', questionId, userType, userId, getISTTimestamp()]
+    );
+
+    res.json({ message: 'Question created', questionId });
+  } catch (err) {
+    console.error('Database error creating question:', err.message);
+    return res.status(400).json({ error: `Failed to create question: ${err.message}` });
+  }
 });
 
 // PUT update a question with optional images
-router.put('/:id', upload, (req, res) => {
+router.put('/:id', upload, async (req, res) => {
   console.log(`Updating question with id: ${req.params.id}`, req.body, req.files);
   const { courseId, coNumber, kLevel, question, option1, option2, option3, option4, answer, weightage, userType, userId } = req.body;
   if (!courseId || !coNumber || !kLevel || !question || !option1 || !option2 || !option3 || !option4 || !answer) {
@@ -104,56 +141,58 @@ router.put('/:id', upload, (req, res) => {
     return res.status(400).json({ error: `Invalid answer: ${answer}. Must be one of: ${validAnswers.join(', ')}` });
   }
 
-  // Validate kLevel against course's coDetails
-  db.get(`SELECT coDetails FROM courses WHERE id = ?`, [courseId], (err, row) => {
-    if (err) return res.status(500).json({ error: `Database error: ${err.message}` });
-    if (!row) return res.status(404).json({ error: 'Course not found' });
+  try {
+    // Validate kLevel against course's coDetails
+    const courseResult = await pgPool.query(`SELECT codetails FROM courses WHERE id = $1`, [courseId]);
+    if (courseResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Course not found' });
+    }
 
-    const coDetails = JSON.parse(row.coDetails);
+    const coDetails = JSON.parse(courseResult.rows[0].codetails || '[]');
     const selectedCO = coDetails.find(co => co.coNumber === coNumber);
-    if (!selectedCO) return res.status(400).json({ error: `CO ${coNumber} not found in course` });
+    if (!selectedCO) {
+      return res.status(400).json({ error: `CO ${coNumber} not found in course` });
+    }
     if (kLevel < 1 || kLevel > 14 || kLevel > selectedCO.kLevel) {
       return res.status(400).json({ error: `K-Level must be between 1 and ${selectedCO.kLevel} for CO ${coNumber}` });
     }
 
-    // Get image paths (fetch existing images if not updated)
-    db.get(`SELECT questionImage, option1Image, option2Image, option3Image, option4Image FROM questions WHERE id = ?`, [req.params.id], (err, row) => {
-      if (err) return res.status(500).json({ error: `Database error: ${err.message}` });
-      if (!row) return res.status(404).json({ error: 'Question not found' });
+    // Get existing image paths
+    const questionResult = await pgPool.query(
+      `SELECT questionimage, option1image, option2image, option3image, option4image FROM questions WHERE id = $1`,
+      [req.params.id]
+    );
+    if (questionResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Question not found' });
+    }
+    const existing = questionResult.rows[0];
 
-      const questionImage = req.files.questionImage ? req.files.questionImage[0].path : row.questionImage;
-      const option1Image = req.files.option1Image ? req.files.option1Image[0].path : row.option1Image;
-      const option2Image = req.files.option2Image ? req.files.option2Image[0].path : row.option2Image;
-      const option3Image = req.files.option3Image ? req.files.option3Image[0].path : row.option3Image;
-      const option4Image = req.files.option4Image ? req.files.option4Image[0].path : row.option4Image;
+    // Use new images if provided, otherwise keep existing
+    const questionImage = req.files.questionImage ? req.files.questionImage[0].path : existing.questionimage;
+    const option1Image = req.files.option1Image ? req.files.option1Image[0].path : existing.option1image;
+    const option2Image = req.files.option2Image ? req.files.option2Image[0].path : existing.option2image;
+    const option3Image = req.files.option3Image ? req.files.option3Image[0].path : existing.option3image;
+    const option4Image = req.files.option4Image ? req.files.option4Image[0].path : existing.option4image;
 
-      db.run(
-        `UPDATE questions SET coNumber = ?, kLevel = ?, question = ?, questionImage = ?, option1 = ?, option1Image = ?, option2 = ?, option2Image = ?, option3 = ?, option3Image = ?, option4 = ?, option4Image = ?, answer = ?, weightage = ? WHERE id = ?`,
-        [coNumber, kLevel, question, questionImage, option1, option1Image, option2, option2Image, option3, option3Image, option4, option4Image, answer, weightage || 1, req.params.id],
-        (err) => {
-          if (err) {
-            console.error('Database error updating question:', err.message);
-            return res.status(400).json({ error: `Failed to update question: ${err.message}` });
-          }
-          db.run(
-            `INSERT INTO course_history (courseId, action, questionId, userType, userId, timestamp) VALUES (?, ?, ?, ?, ?, ?)`,
-            [courseId, 'updated', req.params.id, userType, userId, getISTTimestamp()],
-            (err) => {
-              if (err) {
-                console.error('Database error updating course history:', err.message);
-                return res.status(400).json({ error: `Failed to log history: ${err.message}` });
-              }
-              res.json({ message: 'Question updated' });
-            }
-          );
-        }
-      );
-    });
-  });
+    await pgPool.query(
+      `UPDATE questions SET conumber = $1, klevel = $2, question = $3, questionimage = $4, option1 = $5, option1image = $6, option2 = $7, option2image = $8, option3 = $9, option3image = $10, option4 = $11, option4image = $12, answer = $13, weightage = $14 WHERE id = $15`,
+      [coNumber, kLevel, question, questionImage, option1, option1Image, option2, option2Image, option3, option3Image, option4, option4Image, answer, weightage || 1, req.params.id]
+    );
+
+    await pgPool.query(
+      `INSERT INTO course_history (courseid, action, questionid, usertype, userid, timestamp) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [courseId, 'updated', req.params.id, userType, userId, getISTTimestamp()]
+    );
+
+    res.json({ message: 'Question updated' });
+  } catch (err) {
+    console.error('Database error updating question:', err.message);
+    return res.status(400).json({ error: `Failed to update question: ${err.message}` });
+  }
 });
 
 // DELETE multiple questions (bulk delete)
-router.delete('/bulk', (req, res) => {
+router.delete('/bulk', async (req, res) => {
   console.log(`Attempting to delete questions with ids: ${req.body.questionIds} by userId: ${req.body.userId}`);
   const { questionIds, userType, userId, courseId } = req.body;
 
@@ -168,100 +207,36 @@ router.delete('/bulk', (req, res) => {
     return res.status(400).json({ error: 'questionIds must be a non-empty array' });
   }
 
-  // Fetch image paths for all questions to be deleted
-  db.all(`SELECT id, questionImage, option1Image, option2Image, option3Image, option4Image FROM questions WHERE id IN (${questionIds.map(() => '?').join(',')})`, questionIds, (err, rows) => {
-    if (err) {
-      console.error('Database error fetching question images:', err.message);
-      return res.status(500).json({ error: `Database error: ${err.message}` });
-    }
+  let client;
+  try {
+    client = await pgPool.connect();
+    await client.query('BEGIN');
 
-    // Check if all requested questions exist
-    if (rows.length !== questionIds.length) {
-      const foundIds = rows.map(row => row.id);
+    // Fetch image paths
+    const imageResult = await client.query(
+      `SELECT id, questionimage, option1image, option2image, option3image, option4image FROM questions WHERE id = ANY($1::integer[])`,
+      [questionIds]
+    );
+
+    // Check if all questions exist
+    if (imageResult.rows.length !== questionIds.length) {
+      const foundIds = imageResult.rows.map(row => row.id);
       const missingIds = questionIds.filter(id => !foundIds.includes(id));
-      return res.status(404).json({ error: `Some questions not found: ${missingIds.join(', ')}` });
+      throw new Error(`Some questions not found: ${missingIds.join(', ')}`);
     }
 
-    // Delete questions from database
-    db.run(`DELETE FROM questions WHERE id IN (${questionIds.map(() => '?').join(',')})`, questionIds, function (err) {
-      if (err) {
-        console.error('Database error deleting questions:', err.message);
-        return res.status(400).json({ error: `Failed to delete questions: ${err.message}` });
-      }
-      if (this.changes === 0) {
-        return res.status(404).json({ error: 'No questions found to delete' });
-      }
-
-      // Delete associated image files
-      rows.forEach(row => {
-        const images = [row.questionImage, row.option1Image, row.option2Image, row.option3Image, row.option4Image];
-        images.forEach(image => {
-          if (image && fs.existsSync(image)) {
-            fs.unlink(image, (err) => {
-              if (err) console.error(`Error deleting image ${image}:`, err.message);
-            });
-          }
-        });
-      });
-
-      // Log deletion in course_history for each question
-      const placeholders = questionIds.map(() => '(?, ?, ?, ?, ?, ?)').join(', ');
-      const historyValues = questionIds.reduce((acc, id) => {
-        acc.push(courseId, 'deleted', id, userType, userId, getISTTimestamp());
-        return acc;
-      }, []);
-
-      db.run(
-        `INSERT INTO course_history (courseId, action, questionId, userType, userId, timestamp) VALUES ${placeholders}`,
-        historyValues,
-        (err) => {
-          if (err) {
-            console.error('Database error logging history:', err.message);
-            return res.status(400).json({ error: `Failed to log history: ${err.message}` });
-          }
-          res.json({ message: `${questionIds.length} questions deleted` });
-        }
-      );
-    });
-  });
-});
-
-// DELETE question (single)
-router.delete('/:id', (req, res) => {
-  console.log(`Attempting to delete question with id: ${req.params.id} by userId: ${req.body.userId}`);
-  const { userType, userId, courseId } = req.body;
-
-  // Basic check for admin access
-  if (userType !== 'admin') {
-    return res.status(403).json({ error: 'Forbidden: Admin access required' });
-  }
-
-  if (!courseId) {
-    return res.status(400).json({ error: 'courseId is required' });
-  }
-
-  // Fetch image paths to delete files
-  db.get(`SELECT questionImage, option1Image, option2Image, option3Image, option4Image FROM questions WHERE id = ?`, [req.params.id], (err, row) => {
-    if (err) {
-      console.error('Database error fetching question images:', err.message);
-      return res.status(500).json({ error: `Database error: ${err.message}` });
-    }
-    if (!row) {
-      return res.status(404).json({ error: 'Question not found' });
+    // Delete questions
+    const deleteResult = await client.query(
+      `DELETE FROM questions WHERE id = ANY($1::integer[])`,
+      [questionIds]
+    );
+    if (deleteResult.rowCount === 0) {
+      throw new Error('No questions found to delete');
     }
 
-    // Delete question from database
-    db.run(`DELETE FROM questions WHERE id = ?`, [req.params.id], function (err) {
-      if (err) {
-        console.error('Database error deleting question:', err.message);
-        return res.status(400).json({ error: `Failed to delete question: ${err.message}` });
-      }
-      if (this.changes === 0) {
-        return res.status(404).json({ error: 'Question not found' });
-      }
-
-      // Delete associated image files
-      const images = [row.questionImage, row.option1Image, row.option2Image, row.option3Image, row.option4Image];
+    // Delete image files
+    imageResult.rows.forEach(row => {
+      const images = [row.questionimage, row.option1image, row.option2image, row.option3image, row.option4image];
       images.forEach(image => {
         if (image && fs.existsSync(image)) {
           fs.unlink(image, (err) => {
@@ -269,24 +244,104 @@ router.delete('/:id', (req, res) => {
           });
         }
       });
-
-      db.run(
-        `INSERT INTO course_history (courseId, action, questionId, userType, userId, timestamp) VALUES (?, ?, ?, ?, ?, ?)`,
-        [courseId, 'deleted', req.params.id, userType, userId, getISTTimestamp()],
-        (err) => {
-          if (err) {
-            console.error('Database error deleting course history:', err.message);
-            return res.status(400).json({ error: `Failed to log history: ${err.message}` });
-          }
-          res.json({ message: 'Question deleted' });
-        }
-      );
     });
-  });
+
+    // Log deletion in course_history
+    const historyValues = questionIds.map(id => [courseId, 'deleted', id, userType, userId, getISTTimestamp()]);
+    for (const values of historyValues) {
+      await client.query(
+        `INSERT INTO course_history (courseid, action, questionid, usertype, userid, timestamp) VALUES ($1, $2, $3, $4, $5, $6)`,
+        values
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ message: `${questionIds.length} questions deleted` });
+  } catch (err) {
+    if (client) {
+      await client.query('ROLLBACK');
+    }
+    console.error('Database error deleting questions:', err.message);
+    return res.status(400).json({ error: `Failed to delete questions: ${err.message}` });
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
+});
+
+// DELETE question (single)
+router.delete('/:id', async (req, res) => {
+  console.log(`Attempting to delete question with id: ${req.params.id} by userId: ${req.body.userId}`);
+  const { userType, userId, courseId } = req.body;
+
+  // Basic check for admin access
+  if (userType !== 'admin') {
+    return res.status(403).json({ error: 'Forbidden: Admin access required' });
+  }
+  if (!courseId) {
+    return res.status(400).json({ error: 'courseId is required' });
+  }
+
+  let client;
+  try {
+    client = await pgPool.connect();
+    await client.query('BEGIN');
+
+    // Fetch image paths
+    const imageResult = await client.query(
+      `SELECT questionimage, option1image, option2image, option3image, option4image FROM questions WHERE id = $1`,
+      [req.params.id]
+    );
+    if (imageResult.rows.length === 0) {
+      throw new Error('Question not found');
+    }
+
+    // Delete question
+    const deleteResult = await client.query(`DELETE FROM questions WHERE id = $1`, [req.params.id]);
+    if (deleteResult.rowCount === 0) {
+      throw new Error('Question not found');
+    }
+
+    // Delete image files
+    const images = [
+      imageResult.rows[0].questionimage,
+      imageResult.rows[0].option1image,
+      imageResult.rows[0].option2image,
+      imageResult.rows[0].option3image,
+      imageResult.rows[0].option4image
+    ];
+    images.forEach(image => {
+      if (image && fs.existsSync(image)) {
+        fs.unlink(image, (err) => {
+          if (err) console.error(`Error deleting image ${image}:`, err.message);
+        });
+      }
+    });
+
+    // Log deletion
+    await client.query(
+      `INSERT INTO course_history (courseid, action, questionid, usertype, userid, timestamp) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [courseId, 'deleted', req.params.id, userType, userId, getISTTimestamp()]
+    );
+
+    await client.query('COMMIT');
+    res.json({ message: 'Question deleted' });
+  } catch (err) {
+    if (client) {
+      await client.query('ROLLBACK');
+    }
+    console.error('Database error deleting question:', err.message);
+    return res.status(400).json({ error: `Failed to delete question: ${err.message}` });
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
 });
 
 // Bulk upload preview
-router.post('/bulk-upload/preview', upload, (req, res) => {
+router.post('/bulk-upload/preview', upload, async (req, res) => {
   console.log('Processing bulk upload preview:', req.body);
   const courseId = req.body.courseId;
   if (!courseId || !req.files.file) {
@@ -315,104 +370,104 @@ router.post('/bulk-upload/preview', upload, (req, res) => {
       throw new Error('Invalid CSV format: headers do not match expected format');
     }
 
-    db.get(`SELECT coDetails FROM courses WHERE id = ?`, [courseId], (err, row) => {
-      if (err) return res.status(500).json({ error: `Database error: ${err.message}` });
-      if (!row) return res.status(404).json({ error: 'Course not found' });
+    const courseResult = await pgPool.query(`SELECT codetails FROM courses WHERE id = $1`, [courseId]);
+    if (courseResult.rows.length === 0) {
+      throw new Error('Course not found');
+    }
 
-      const coDetails = JSON.parse(row.coDetails);
-      const questions = [];
-      const errors = [];
+    const coDetails = JSON.parse(courseResult.rows[0].codetails || '[]');
+    const questions = [];
+    const errors = [];
 
-      // Process rows, skipping header
-      const dataRows = data.slice(1).filter(row => {
-        // Skip rows that are completely empty or start with a comment
-        const isEmpty = row.every(cell => cell === undefined || cell === '');
-        const isComment = row[0] && row[0].toString().trim().startsWith('#');
-        return !isEmpty && !isComment;
-      });
-
-      dataRows.forEach((row, index) => {
-        try {
-          const coNumber = row[0]?.toString().trim();
-          const kLevel = parseInt(row[1]);
-          const question = row[2]?.toString().trim();
-          const questionImage = row[3]?.toString().trim() || null;
-          const option1 = row[4]?.toString().trim();
-          const option1Image = row[5]?.toString().trim() || null;
-          const option2 = row[6]?.toString().trim();
-          const option2Image = row[7]?.toString().trim() || null;
-          const option3 = row[8]?.toString().trim();
-          const option3Image = row[9]?.toString().trim() || null;
-          const option4 = row[10]?.toString().trim();
-          const option4Image = row[11]?.toString().trim() || null;
-          const answer = row[12]?.toString().trim();
-          const weightage = parseFloat(row[13]) || 1;
-
-          // Validate required fields
-          if (!coNumber || !kLevel || !question || !option1 || !option2 || !option3 || !option4 || !answer) {
-            throw new Error('Missing required fields');
-          }
-
-          // Validate CO
-          const selectedCO = coDetails.find(co => co.coNumber === coNumber);
-          if (!selectedCO) {
-            throw new Error(`CO ${coNumber} not found in course`);
-          }
-
-          // Validate K-Level
-          if (isNaN(kLevel) || kLevel < 1 || kLevel > 14 || kLevel > selectedCO.kLevel) {
-            throw new Error(`K-Level ${kLevel} invalid for CO ${coNumber} (max ${selectedCO.kLevel})`);
-          }
-
-          // Validate answer
-          const answerMap = {
-            'option1': 'option1',
-            'option2': 'option2',
-            'option3': 'option3',
-            'option4': 'option4'
-          };
-          const mappedAnswer = answerMap[answer.toLowerCase()];
-          if (!mappedAnswer) {
-            throw new Error(`Invalid answer: ${answer}. Must be one of: option1, option2, option3, option4`);
-          }
-
-          // Validate weightage
-          if (isNaN(weightage) || weightage <= 0) {
-            throw new Error(`Invalid weightage: ${weightage}. Must be a positive number`);
-          }
-
-          questions.push({
-            courseId: parseInt(courseId),
-            coNumber,
-            kLevel,
-            question,
-            questionImage,
-            option1,
-            option1Image,
-            option2,
-            option2Image,
-            option3,
-            option3Image,
-            option4,
-            option4Image,
-            answer: mappedAnswer,
-            weightage
-          });
-        } catch (error) {
-          errors.push(`Row ${index + 2}: ${error.message}`);
-        }
-      });
-
-      if (errors.length > 0) {
-        return res.status(400).json({ error: 'Errors in CSV data', details: errors });
-      }
-
-      if (questions.length === 0) {
-        return res.status(400).json({ error: 'No valid questions found in CSV' });
-      }
-
-      res.json({ questions });
+    // Process rows, skipping header
+    const dataRows = data.slice(1).filter(row => {
+      // Skip rows that are completely empty or start with a comment
+      const isEmpty = row.every(cell => cell === undefined || cell === '');
+      const isComment = row[0] && row[0].toString().trim().startsWith('#');
+      return !isEmpty && !isComment;
     });
+
+    dataRows.forEach((row, index) => {
+      try {
+        const coNumber = row[0]?.toString().trim();
+        const kLevel = parseInt(row[1]);
+        const question = row[2]?.toString().trim();
+        const questionImage = row[3]?.toString().trim() || null;
+        const option1 = row[4]?.toString().trim();
+        const option1Image = row[5]?.toString().trim() || null;
+        const option2 = row[6]?.toString().trim();
+        const option2Image = row[7]?.toString().trim() || null;
+        const option3 = row[8]?.toString().trim();
+        const option3Image = row[9]?.toString().trim() || null;
+        const option4 = row[10]?.toString().trim();
+        const option4Image = row[11]?.toString().trim() || null;
+        const answer = row[12]?.toString().trim();
+        const weightage = parseFloat(row[13]) || 1;
+
+        // Validate required fields
+        if (!coNumber || !kLevel || !question || !option1 || !option2 || !option3 || !option4 || !answer) {
+          throw new Error('Missing required fields');
+        }
+
+        // Validate CO
+        const selectedCO = coDetails.find(co => co.coNumber === coNumber);
+        if (!selectedCO) {
+          throw new Error(`CO ${coNumber} not found in course`);
+        }
+
+        // Validate K-Level
+        if (isNaN(kLevel) || kLevel < 1 || kLevel > 14 || kLevel > selectedCO.kLevel) {
+          throw new Error(`K-Level ${kLevel} invalid for CO ${coNumber} (max ${selectedCO.kLevel})`);
+        }
+
+        // Validate answer
+        const answerMap = {
+          'option1': 'option1',
+          'option2': 'option2',
+          'option3': 'option3',
+          'option4': 'option4'
+        };
+        const mappedAnswer = answerMap[answer.toLowerCase()];
+        if (!mappedAnswer) {
+          throw new Error(`Invalid answer: ${answer}. Must be one of: option1, option2, option3, option4`);
+        }
+
+        // Validate weightage
+        if (isNaN(weightage) || weightage <= 0) {
+          throw new Error(`Invalid weightage: ${weightage}. Must be a positive number`);
+        }
+
+        questions.push({
+          courseId: parseInt(courseId),
+          coNumber,
+          kLevel,
+          question,
+          questionImage,
+          option1,
+          option1Image,
+          option2,
+          option2Image,
+          option3,
+          option3Image,
+          option4,
+          option4Image,
+          answer: mappedAnswer,
+          weightage
+        });
+      } catch (error) {
+        errors.push(`Row ${index + 2}: ${error.message}`);
+      }
+    });
+
+    if (errors.length > 0) {
+      return res.status(400).json({ error: 'Errors in CSV data', details: errors });
+    }
+
+    if (questions.length === 0) {
+      return res.status(400).json({ error: 'No valid questions found in CSV' });
+    }
+
+    res.json({ questions });
   } catch (error) {
     console.error('Error processing CSV:', error.message);
     return res.status(400).json({ error: `Failed to process CSV: ${error.message}` });
@@ -426,67 +481,70 @@ router.post('/bulk-upload/preview', upload, (req, res) => {
 });
 
 // Bulk upload confirm
-router.post('/bulk-upload/confirm', (req, res) => {
+router.post('/bulk-upload/confirm', async (req, res) => {
   console.log('Confirming bulk upload:', req.body);
   const { courseId, userType, userId, questions } = req.body;
   if (!courseId || !userType || !userId || !questions || !Array.isArray(questions) || questions.length === 0) {
     return res.status(400).json({ error: 'courseId, userType, userId, and questions array are required' });
   }
 
-  db.get(`SELECT coDetails FROM courses WHERE id = ?`, [courseId], (err, row) => {
-    if (err) return res.status(500).json({ error: `Database error: ${err.message}` });
-    if (!row) return res.status(404).json({ error: 'Course not found' });
+  let client;
+  try {
+    client = await pgPool.connect();
+    await client.query('BEGIN');
 
-    const coDetails = JSON.parse(row.coDetails);
+    const courseResult = await client.query(`SELECT codetails FROM courses WHERE id = $1`, [courseId]);
+    if (courseResult.rows.length === 0) {
+      throw new Error('Course not found');
+    }
+
+    const coDetails = JSON.parse(courseResult.rows[0].codetails || '[]');
     let insertedCount = 0;
 
-    const insertQuestion = (index) => {
-      if (index >= questions.length) {
-        return res.json({ message: `${insertedCount} questions uploaded successfully` });
-      }
-
+    for (let index = 0; index < questions.length; index++) {
       const q = questions[index];
       const selectedCO = coDetails.find(co => co.coNumber === q.coNumber);
       if (!selectedCO) {
-        return res.status(400).json({ error: `CO ${q.coNumber} not found in course at question ${index + 1}` });
+        throw new Error(`CO ${q.coNumber} not found in course at question ${index + 1}`);
       }
       if (q.kLevel < 1 || q.kLevel > 14 || q.kLevel > selectedCO.kLevel) {
-        return res.status(400).json({ error: `K-Level ${q.kLevel} invalid for CO ${q.coNumber} at question ${index + 1}` });
+        throw new Error(`K-Level ${q.kLevel} invalid for CO ${q.coNumber} at question ${index + 1}`);
       }
 
-      db.run(
-        `INSERT INTO questions (courseId, coNumber, kLevel, question, questionImage, option1, option1Image, option2, option2Image, option3, option3Image, option4, option4Image, answer, weightage) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      const questionResult = await client.query(
+        `INSERT INTO questions (courseid, conumber, klevel, question, questionimage, option1, option1image, option2, option2image, option3, option3image, option4, option4image, answer, weightage) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+         RETURNING id`,
         [
           courseId, q.coNumber, q.kLevel, q.question, q.questionImage,
           q.option1, q.option1Image, q.option2, q.option2Image,
           q.option3, q.option3Image, q.option4, q.option4Image,
           q.answer, q.weightage
-        ],
-        function (err) {
-          if (err) {
-            console.error('Database error inserting question:', err.message);
-            return res.status(400).json({ error: `Failed to insert question ${index + 1}: ${err.message}` });
-          }
-          const questionId = this.lastID;
-          db.run(
-            `INSERT INTO course_history (courseId, action, questionId, userType, userId, timestamp) VALUES (?, ?, ?, ?, ?, ?)`,
-            [courseId, 'added', questionId, userType, userId, getISTTimestamp()],
-            (err) => {
-              if (err) {
-                console.error('Database error logging history:', err.message);
-                return res.status(400).json({ error: `Failed to log history for question ${index + 1}: ${err.message}` });
-              }
-              insertedCount++;
-              insertQuestion(index + 1);
-            }
-          );
-        }
+        ]
       );
-    };
+      const questionId = questionResult.rows[0].id;
 
-    insertQuestion(0);
-  });
+      await client.query(
+        `INSERT INTO course_history (courseid, action, questionid, usertype, userid, timestamp) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [courseId, 'added', questionId, userType, userId, getISTTimestamp()]
+      );
+
+      insertedCount++;
+    }
+
+    await client.query('COMMIT');
+    res.json({ message: `${insertedCount} questions uploaded successfully` });
+  } catch (err) {
+    if (client) {
+      await client.query('ROLLBACK');
+    }
+    console.error('Database error inserting questions:', err.message);
+    return res.status(400).json({ error: `Failed to insert questions: ${err.message}` });
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
 });
 
 module.exports = router;

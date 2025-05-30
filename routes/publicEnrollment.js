@@ -1,59 +1,56 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../model');
+const pgPool = require('../model');
 const multer = require('multer');
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, 'uploads/'),
+  destination: (req, file, cb) => cb(null, 'Uploads/'),
   filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
 });
 const upload = multer({ storage });
 
 // GET /api/public-enrollment - Fetch all public courses
-router.get('/', (req, res) => {
+router.get('/', async (req, res) => {
   console.log('Received GET request for /api/public-enrollment');
-  db.all(
-    `SELECT id, name, description, examDate, examTime, isDraft, isRegistrationOpen 
-     FROM courses 
-     WHERE isDraft = 0 AND isRegistrationOpen = 1`,
-    [],
-    (err, rows) => {
-      if (err) {
-        console.error('Database error fetching courses:', err.message);
-        return res.status(500).json({ error: `Internal server error: ${err.message}` });
-      }
-      console.log('Fetched courses:', rows);
-      res.json(rows);
-    }
-  );
+  try {
+    const { rows } = await pgPool.query(
+      `SELECT id, name, description, examdate, examtime, isdraft, isregistrationopen 
+       FROM courses 
+       WHERE isdraft = FALSE AND isregistrationopen = TRUE`
+    );
+    console.log('Fetched courses:', rows);
+    res.json(rows);
+  } catch (err) {
+    console.error('Database error fetching courses:', err.message);
+    return res.status(500).json({ error: `Internal server error: ${err.message}` });
+  }
 });
 
 // GET /api/public-enrollment/:id - Fetch a specific public course
-router.get('/:id', (req, res) => {
+router.get('/:id', async (req, res) => {
   console.log('Received GET request for /api/public-enrollment/:id', req.params.id);
-  db.get(
-    `SELECT id, name, description, examDate, examTime, isDraft, isRegistrationOpen 
-     FROM courses 
-     WHERE id = ? AND isDraft = 0 AND isRegistrationOpen = 1`,
-    [req.params.id],
-    (err, row) => {
-      if (err) {
-        console.error('Database error fetching course:', err.message);
-        return res.status(500).json({ error: `Internal server error: ${err.message}` });
-      }
-      if (!row) {
-        console.log('Course not found for id:', req.params.id);
-        return res.status(404).json({ error: 'Course not found, not public, or registration closed' });
-      }
-      console.log('Fetched course:', row);
-      res.json(row);
+  try {
+    const { rows } = await pgPool.query(
+      `SELECT id, name, description, examdate, examtime, isdraft, isregistrationopen 
+       FROM courses 
+       WHERE id = $1 AND isdraft = FALSE AND isregistrationopen = TRUE`,
+      [req.params.id]
+    );
+    if (rows.length === 0) {
+      console.log('Course not found for id:', req.params.id);
+      return res.status(404).json({ error: 'Course not found, not public, or registration closed' });
     }
-  );
+    console.log('Fetched course:', rows[0]);
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Database error fetching course:', err.message);
+    return res.status(500).json({ error: `Internal server error: ${err.message}` });
+  }
 });
 
 // POST /api/public-enrollment - Enroll student in a course
-router.post('/', (req, res) => {
+router.post('/', async (req, res) => {
   const { studentId, courseId } = req.body;
 
   console.log('Received POST request for /api/public-enrollment', req.body);
@@ -61,101 +58,87 @@ router.post('/', (req, res) => {
     return res.status(400).json({ error: 'Student ID and Course ID are required' });
   }
 
-  db.get(
-    `SELECT * FROM courses WHERE id = ? AND isDraft = 0 AND isRegistrationOpen = 1`,
-    [courseId],
-    (err, course) => {
-      if (err) {
-        console.error('Database error fetching course:', err.message);
-        return res.status(500).json({ error: `Internal server error: ${err.message}` });
-      }
-      if (!course) {
-        console.log('Course not found or registration not open for id:', courseId);
-        return res.status(404).json({ error: 'Course not found or registration is not open' });
-      }
-
-      db.get(
-        `SELECT * FROM student_courses WHERE studentId = ? AND courseId = ?`,
-        [studentId, courseId],
-        (err, enrollment) => {
-          if (err) {
-            console.error('Database error checking enrollment:', err.message);
-            return res.status(500).json({ error: `Internal server error: ${err.message}` });
-          }
-          if (enrollment) {
-            return res.status(400).json({ error: 'Student is already enrolled in this course' });
-          }
-
-          db.run(
-            `INSERT INTO student_courses (studentId, courseId, startDate, startTime) VALUES (?, ?, ?, ?)`,
-            [studentId, courseId, course.examDate, course.examTime],
-            (err) => {
-              if (err) {
-                console.error('Database error enrolling student:', err.message);
-                return res.status(400).json({ error: `Failed to enroll: ${err.message}` });
-              }
-              console.log(`Student ${studentId} enrolled in course ${courseId}`);
-              res.json({ message: 'Successfully enrolled in the course', studentId: studentId });
-            }
-          );
-        }
-      );
+  try {
+    const courseResult = await pgPool.query(
+      `SELECT * FROM courses WHERE id = $1 AND isdraft = FALSE AND isregistrationopen = TRUE`,
+      [courseId]
+    );
+    if (courseResult.rows.length === 0) {
+      console.log('Course not found or registration not open for id:', courseId);
+      return res.status(404).json({ error: 'Course not found or registration is not open' });
     }
-  );
+    const course = courseResult.rows[0];
+
+    const enrollmentResult = await pgPool.query(
+      `SELECT * FROM student_courses WHERE studentid = $1 AND courseid = $2`,
+      [studentId, courseId]
+    );
+    if (enrollmentResult.rows.length > 0) {
+      return res.status(400).json({ error: 'Student is already enrolled in this course' });
+    }
+
+    await pgPool.query(
+      `INSERT INTO student_courses (studentid, courseid, startdate, starttime) VALUES ($1, $2, $3, $4)`,
+      [studentId, courseId, course.examdate, course.examtime]
+    );
+    console.log(`Student ${studentId} enrolled in course ${courseId}`);
+    res.json({ message: 'Successfully enrolled in the course', studentId });
+  } catch (err) {
+    console.error('Database error enrolling student:', err.message);
+    return res.status(400).json({ error: `Failed to enroll: ${err.message}` });
+  }
 });
 
 // GET /api/public-enrollment/student-courses/:studentId - Fetch enrolled courses with student details
-router.get('/student-courses/:studentId', (req, res) => {
+router.get('/student-courses/:studentId', async (req, res) => {
   console.log('Received GET request for /api/public-enrollment/student-courses/:studentId', req.params.studentId);
-  db.all(
-    `SELECT c.id, c.name, c.description, c.examDate, c.examTime, 
-            s.name AS studentName, s.registerNo AS studentRegisterNo, s.aadharNumber, s.abcId
-     FROM student_courses sc
-     JOIN courses c ON sc.courseId = c.id
-     JOIN students s ON sc.studentId = s.id
-     WHERE sc.studentId = ?`,
-    [req.params.studentId],
-    (err, rows) => {
-      if (err) {
-        console.error('Database error fetching enrolled courses:', err.message);
-        return res.status(500).json({ error: `Internal server error: ${err.message}` });
-      }
-      if (rows.length === 0) {
-        console.log('No enrolled courses found for studentId:', req.params.studentId);
-        return res.status(404).json({ error: 'No enrolled courses found for this student' });
-      }
-      console.log('Fetched enrolled courses:', rows);
-      res.json(rows);
+  try {
+    const { rows } = await pgPool.query(
+      `SELECT c.id, c.name, c.description, c.examdate, c.examtime, 
+             s.name AS studentname, s.registerNo as studentregisterNo, s.aadharNumber, s.abcId
+      FROM student_courses sc
+      JOIN courses c ON sc.courseid = c.id
+      JOIN students s ON sc.studentid = s.id
+      WHERE sc.studentid = $1`,
+      [req.params.studentId]
+    );
+    if (rows.length === 0) {
+      console.log('No registered student found for studentId:', req.params.studentId);
+      return res.status(404).json({ error: 'No registered courses found for this student' });
     }
-  );
+    console.log('Courses fetched:', rows);
+    res.json(rows);
+  } catch (err) {
+    console.error('Database error fetching enrolled courses:', err.message);
+    return res.status(500).json({ error: `Internal server error: ${err.message}` });
+  }
 });
 
 // GET /api/public-enrollment/profile/:registerNo - Fetch student profile
-router.get('/profile/:registerNo', (req, res) => {
+router.get('/profile/:registerNo', async (req, res) => {
   const { registerNo } = req.params;
   console.log('Received GET request for /api/public-enrollment/profile/', registerNo);
-  db.get(
-    `SELECT id, name, registerNo, dob, aadharNumber, abcId, photo, eSignature 
-     FROM students 
-     WHERE registerNo = ?`,
-    [registerNo],
-    (err, row) => {
-      if (err) {
-        console.error('Database error fetching student:', err.message);
-        return res.status(500).json({ error: `Internal server error: ${err.message}` });
-      }
-      if (!row) {
-        console.log('Student not found for registerNo:', registerNo);
-        return res.status(404).json({ error: 'Student not found' });
-      }
-      console.log('Fetched student:', row);
-      res.json(row);
+  try {
+    const { rows } = await pgPool.query(
+      `SELECT id, name, registerNo, dob, aadharNumber, abcId, photo, esignature 
+       FROM students 
+       WHERE registerNo = $1`,
+      [registerNo]
+    );
+    if (rows.length === 0) {
+      console.log('Student not found for registerNo:', registerNo);
+      return res.status(404).json({ error: 'Student not found' });
     }
-  );
+    console.log('Fetched student:', rows[0]);
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Database error fetching student:', err.message);
+    return res.status(500).json({ error: `Internal server error: ${err.message}` });
+  }
 });
 
 // POST /api/public-enrollment/student - Create a new student
-router.post('/student', (req, res) => {
+router.post('/student', async (req, res) => {
   const { name, registerNo, dob, password, source } = req.body;
   console.log('Received POST request for /api/public-enrollment/student', req.body);
 
@@ -163,32 +146,29 @@ router.post('/student', (req, res) => {
     return res.status(400).json({ error: 'Register Number, DOB, and Source are required' });
   }
 
-  db.get(`SELECT id FROM students WHERE registerNo = ?`, [registerNo], (err, row) => {
-    if (err) {
-      console.error('Database error checking student:', err.message);
-      return res.status(500).json({ error: `Internal server error: ${err.message}` });
-    }
-    if (row) {
+  try {
+    const existingStudent = await pgPool.query(
+      `SELECT id FROM students WHERE registerNo = $1`,
+      [registerNo]
+    );
+    if (existingStudent.rows.length > 0) {
       return res.status(400).json({ error: 'Student with this Register Number already exists' });
     }
 
-    db.run(
-      `INSERT INTO students (name, registerNo, dob, password, source) VALUES (?, ?, ?, ?, ?)`,
-      [name || `Student_${registerNo}`, registerNo, dob, password || dob, source],
-      function (err) {
-        if (err) {
-          console.error('Database error creating student:', err.message);
-          return res.status(500).json({ error: `Internal server error: ${err.message}` });
-        }
-        console.log(`Student created with ID: ${this.lastID}`);
-        res.json({ message: 'Student created successfully', studentId: this.lastID });
-      }
+    const { rows } = await pgPool.query(
+      `INSERT INTO students (name, registerNo, dob, password, source) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [name || `Student_${registerNo}`, registerNo, dob, password || dob, source]
     );
-  });
+    console.log(`Student created with ID: ${rows[0].id}`);
+    res.json({ message: 'Student created successfully', studentId: rows[0].id });
+  } catch (err) {
+    console.error('Database error creating student:', err.message);
+    return res.status(500).json({ error: `Internal server error: ${err.message}` });
+  }
 });
 
 // PUT /api/public-enrollment/profile/:registerNo - Update student profile
-router.put('/profile/:registerNo', upload.fields([{ name: 'photo' }, { name: 'eSignature' }]), (req, res) => {
+router.put('/profile/:registerNo', upload.fields([{ name: 'photo' }, { name: 'eSignature' }]), async (req, res) => {
   const { registerNo } = req.params;
   const { name, dob, aadharNumber, abcId } = req.body;
   const photo = req.files?.photo ? req.files.photo[0].path : null;
@@ -209,42 +189,45 @@ router.put('/profile/:registerNo', upload.fields([{ name: 'photo' }, { name: 'eS
     return res.status(400).json({ error: 'ABC ID must be 12 alphanumeric characters' });
   }
 
-  db.get(`SELECT id FROM students WHERE registerNo = ?`, [registerNo], (err, row) => {
-    if (err) {
-      console.error('Database error fetching student:', err.message);
-      return res.status(500).json({ error: `Internal server error: ${err.message}` });
-    }
-    if (!row) {
+  try {
+    const studentResult = await pgPool.query(
+      `SELECT id FROM students WHERE registerNo = $1`,
+      [registerNo]
+    );
+    if (studentResult.rows.length === 0) {
       return res.status(404).json({ error: 'Student not found' });
     }
 
-    const updates = ['name = ?', 'aadharNumber = ?', 'abcId = ?'];
+    const updates = ['name = $1', 'aadharNumber = $2', 'abcId = $3'];
     const params = [name, aadharNumber, abcId];
+    let paramIndex = 4;
+
     if (dob) {
-      updates.push('dob = ?');
+      updates.push(`dob = $${paramIndex++}`);
       params.push(dob);
     }
     if (photo) {
-      updates.push('photo = ?');
+      updates.push(`photo = $${paramIndex++}`);
       params.push(photo);
     }
     if (eSignature) {
-      updates.push('eSignature = ?');
+      updates.push(`esignature = $${paramIndex++}`);
       params.push(eSignature);
     }
 
     params.push(registerNo);
-    const sql = `UPDATE students SET ${updates.join(', ')} WHERE registerNo = ?`;
+    const sql = `UPDATE students SET ${updates.join(', ')} WHERE registerNo = $${paramIndex}`;
 
-    db.run(sql, params, (err) => {
-      if (err) {
-        console.error('Database error updating student:', err.message);
-        return res.status(500).json({ error: `Database error: ${err.message}` });
-      }
-      console.log(`Student ${registerNo} updated successfully`);
-      res.json({ message: 'Profile updated successfully', studentId: row.id });
-    });
-  });
+    const updateResult = await pgPool.query(sql, params);
+    if (updateResult.rowCount === 0) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+    console.log(`Student ${registerNo} updated successfully`);
+    res.json({ message: 'Profile updated successfully', studentId: studentResult.rows[0].id });
+  } catch (err) {
+    console.error('Database error updating student:', err.message);
+    return res.status(500).json({ error: `Database error: ${err.message}` });
+  }
 });
 
 module.exports = router;

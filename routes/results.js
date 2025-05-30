@@ -1,36 +1,23 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../model');
+const pgPool = require('../model');
 const ExcelJS = require('exceljs');
 const fs = require('fs');
 const path = require('path');
 
-// Fetch all published courses (isDraft = 0), regardless of student
+// Fetch all published courses (isdraft = FALSE), regardless of student
 router.get('/courses/:studentId', async (req, res) => {
   console.log(`Fetching all published courses`);
-
   try {
-    const courses = await new Promise((resolve, reject) => {
-      db.all(
-        `SELECT id, name, course_code, learning_platform, coCount, examMarks
-         FROM courses
-         WHERE isDraft = 0`,
-        [],
-        (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows);
-        }
-      );
-    });
-
-    console.log(`Published courses fetched:`, courses);
-    if (!courses.length) {
-      return res.status(200).json([]);
-    }
-
-    res.json(courses);
+    const { rows } = await pgPool.query(
+      `SELECT id, name, course_code, learning_platform, cocount, exammarks
+       FROM courses
+       WHERE isdraft = FALSE`
+    );
+    console.log(`Published courses fetched:`, rows);
+    res.json(rows || []);
   } catch (error) {
-    console.error('Error fetching courses for results:', error);
+    console.error('Error fetching courses for results:', error.message);
     res.status(500).json({ error: 'Failed to fetch courses' });
   }
 });
@@ -41,91 +28,67 @@ router.get('/:courseId', async (req, res) => {
   console.log(`Fetching results for course ID: ${courseId}`);
 
   try {
-    // Step 1: Fetch course details to get coCount and examMarks
-    const course = await new Promise((resolve, reject) => {
-      db.get(
-        `SELECT coCount, examMarks FROM courses WHERE id = ? AND isDraft = 0`,
-        [courseId],
-        (err, row) => {
-          if (err) reject(err);
-          else resolve(row);
-        }
-      );
-    });
-
-    if (!course) {
+    // Step 1: Fetch course details to get cocount and exammarks
+    const courseResult = await pgPool.query(
+      `SELECT cocount, exammarks FROM courses WHERE id = $1 AND isdraft = FALSE`,
+      [courseId]
+    );
+    if (courseResult.rows.length === 0) {
       console.log(`Course ID ${courseId} not found or not published`);
       return res.status(404).json({ error: 'Course not found or not published' });
     }
 
-    const coCount = course.coCount || 2; // Default to 2 COs
-    const examMarks = course.examMarks || 100; // Total marks for the course
+    const course = courseResult.rows[0];
+    const coCount = course.cocount || 2; // Default to 2 COs
+    const examMarks = course.exammarks || 100; // Total marks for the course
     console.log(`Course details: coCount=${coCount}, examMarks=${examMarks}`);
 
     // Step 2: Fetch all students who have taken the exam for this course
-    const students = await new Promise((resolve, reject) => {
-      db.all(
-        `SELECT DISTINCT s.id, s.name, s.registerNo
-         FROM students s
-         JOIN student_exams se ON s.id = se.studentId
-         WHERE se.courseId = ?`,
-        [courseId],
-        (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows);
-        }
-      );
-    });
-
+    const studentResult = await pgPool.query(
+      `SELECT DISTINCT s.id, s.name, s.registerNo
+       FROM students s
+       JOIN student_exams se ON s.id = se.studentid
+       WHERE se.courseid = $1`,
+      [courseId]
+    );
+    const students = studentResult.rows;
     console.log(`Students who took the exam for course ID ${courseId}:`, students);
     if (!students.length) {
       console.log(`No students have taken the exam for course ID ${courseId}`);
-      return res.status(200).json([]); // No students have taken the exam
+      return res.status(200).json([]);
     }
 
     // Step 3: Fetch all student exams for this course
-    const studentExams = await new Promise((resolve, reject) => {
-      db.all(
-        `SELECT se.studentId, se.questionId, se.selectedAnswer, se.malpracticeFlag, q.coNumber, q.answer, q.weightage
-         FROM student_exams se
-         JOIN questions q ON se.questionId = q.id
-         WHERE se.courseId = ?`,
-        [courseId],
-        (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows);
-        }
-      );
-    });
-
+    const examResult = await pgPool.query(
+      `SELECT se.studentid, se.questionid, se.selectedanswer, se.malpracticeflag, q.conumber, q.answer, q.weightage
+       FROM student_exams se
+       JOIN questions q ON se.questionid = q.id
+       WHERE se.courseid = $1`,
+      [courseId]
+    );
+    const studentExams = examResult.rows;
     console.log(`Student exams for course ID ${courseId}:`, studentExams);
 
     // Step 4: Fetch total possible marks per CO for accurate CO-wise percentages
     const coMaxMarks = {};
     for (let co = 1; co <= coCount; co++) {
-      const coQuestions = await new Promise((resolve, reject) => {
-        db.all(
-          `SELECT SUM(weightage) as maxMarks
-           FROM questions
-           WHERE courseId = ? AND coNumber = ?`,
-          [courseId, `CO${co}`],
-          (err, rows) => {
-            if (err) reject(err);
-            else resolve(rows[0]?.maxMarks || 0);
-          }
-        );
-      });
-      coMaxMarks[`CO${co}`] = coQuestions;
+      const coResult = await pgPool.query(
+        `SELECT SUM(weightage) as maxmarks
+         FROM questions
+         WHERE courseid = $1 AND conumber = $2`,
+        [courseId, `CO${co}`]
+      );
+      coMaxMarks[`CO${co}`] = coResult.rows[0]?.maxmarks || 0;
     }
     console.log(`Max marks per CO for course ID ${courseId}:`, coMaxMarks);
 
     // Step 5: Calculate results for each student who took the exam
     const results = await Promise.all(students.map(async (student) => {
       const studentId = student.id;
-      const studentExamsForThisStudent = studentExams.filter(se => se.studentId === studentId);
+      const studentExamsForThisStudent = studentExams.filter(se => se.studentid === studentId);
 
       // Check if the student has any malpractice flag in their exam submissions
-      const hasMalpractice = studentExamsForThisStudent.some(se => se.malpracticeFlag === 1);
+      const hasMalpractice = studentExamsForThisStudent.some(se => se.malpracticeflag);
       console.log(`Student ID ${studentId}: hasMalpractice=${hasMalpractice}`);
 
       if (hasMalpractice) {
@@ -146,7 +109,7 @@ router.get('/:courseId', async (req, res) => {
       // Calculate CO-wise marks
       const coMarks = {};
       for (let co = 1; co <= coCount; co++) {
-        const coQuestions = studentExamsForThisStudent.filter(se => se.coNumber === `CO${co}`);
+        const coQuestions = studentExamsForThisStudent.filter(se => se.conumber === `CO${co}`);
         console.log(`Student ID ${studentId}, CO${co} questions:`, coQuestions);
         if (coQuestions.length === 0) {
           // If no questions answered for this CO, mark as 'A'
@@ -155,7 +118,7 @@ router.get('/:courseId', async (req, res) => {
         } else {
           let totalMarks = 0;
           coQuestions.forEach(q => {
-            if (q.selectedAnswer === q.answer) {
+            if (q.selectedanswer === q.answer) {
               totalMarks += q.weightage;
             }
           });
@@ -168,12 +131,12 @@ router.get('/:courseId', async (req, res) => {
       // Calculate overall marks dynamically from student_exams
       let overallMarks = 0;
       studentExamsForThisStudent.forEach(se => {
-        if (se.selectedAnswer === se.answer) {
+        if (se.selectedanswer === se.answer) {
           overallMarks += se.weightage;
         }
       });
 
-      // Use examMarks from courses table for overall percentage
+      // Use examMarks for overall percentage
       const overallPercentage = examMarks ? ((overallMarks / examMarks) * 100).toFixed(2) : '0.00';
       console.log(`Student ID ${studentId}: overallMarks=${overallMarks}, examMarks=${examMarks}, overallPercentage=${overallPercentage}`);
 
@@ -190,7 +153,7 @@ router.get('/:courseId', async (req, res) => {
     console.log(`Final results for course ID ${courseId}:`, results);
     res.json(results);
   } catch (error) {
-    console.error('Error fetching results:', error);
+    console.error('Error fetching results:', error.message);
     res.status(500).json({ error: 'Failed to fetch results' });
   }
 });
@@ -201,43 +164,31 @@ router.get('/:courseId/download', async (req, res) => {
   console.log(`Generating Excel report for course ID: ${courseId}`);
 
   try {
-    // Step 1: Fetch course details to get coCount and examMarks
-    const course = await new Promise((resolve, reject) => {
-      db.get(
-        `SELECT name, coCount, examMarks FROM courses WHERE id = ? AND isDraft = 0`,
-        [courseId],
-        (err, row) => {
-          if (err) reject(err);
-          else resolve(row);
-        }
-      );
-    });
-
-    if (!course) {
+    // Step 1: Fetch course details to get name, cocount, and exammarks
+    const courseResult = await pgPool.query(
+      `SELECT name, cocount, exammarks FROM courses WHERE id = $1 AND isdraft = FALSE`,
+      [courseId]
+    );
+    if (courseResult.rows.length === 0) {
       console.log(`Course ID ${courseId} not found or not published`);
       return res.status(404).json({ error: 'Course not found or not published' });
     }
 
+    const course = courseResult.rows[0];
     const courseName = course.name;
-    const coCount = course.coCount || 2; // Default to 2 COs
-    const examMarks = course.examMarks || 100; // Total marks for the course
+    const coCount = course.cocount || 2; // Default to 2 COs
+    const examMarks = course.exammarks || 100; // Total marks for the course
     console.log(`Course details: name=${courseName}, coCount=${coCount}, examMarks=${examMarks}`);
 
-    // Step 2: Fetch all students who have taken the exam for this course, including ABC ID
-    const students = await new Promise((resolve, reject) => {
-      db.all(
-        `SELECT DISTINCT s.id, s.name, s.registerNo, s.abcId
-         FROM students s
-         JOIN student_exams se ON s.id = se.studentId
-         WHERE se.courseId = ?`,
-        [courseId],
-        (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows);
-        }
-      );
-    });
-
+    // Step 2: Fetch all students who have taken the exam for this course, including abcId
+    const studentResult = await pgPool.query(
+      `SELECT DISTINCT s.id, s.name, s.registerNo, s.abcId
+       FROM students s
+       JOIN student_exams se ON s.id = se.studentid
+       WHERE se.courseid = $1`,
+      [courseId]
+    );
+    const students = studentResult.rows;
     console.log(`Students who took the exam for course ID ${courseId}:`, students);
     if (!students.length) {
       console.log(`No students have taken the exam for course ID ${courseId}`);
@@ -245,48 +196,36 @@ router.get('/:courseId/download', async (req, res) => {
     }
 
     // Step 3: Fetch all student exams for this course
-    const studentExams = await new Promise((resolve, reject) => {
-      db.all(
-        `SELECT se.studentId, se.questionId, se.selectedAnswer, se.malpracticeFlag, q.coNumber, q.answer, q.weightage
-         FROM student_exams se
-         JOIN questions q ON se.questionId = q.id
-         WHERE se.courseId = ?`,
-        [courseId],
-        (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows);
-        }
-      );
-    });
-
+    const examResult = await pgPool.query(
+      `SELECT se.studentid, se.questionid, se.selectedanswer, se.malpracticeflag, q.conumber, q.answer, q.weightage
+       FROM student_exams se
+       JOIN questions q ON se.questionid = q.id
+       WHERE se.courseid = $1`,
+      [courseId]
+    );
+    const studentExams = examResult.rows;
     console.log(`Student exams for course ID ${courseId}:`, studentExams);
 
     // Step 4: Fetch total possible marks per CO for accurate CO-wise percentages
     const coMaxMarks = {};
     for (let co = 1; co <= coCount; co++) {
-      const coQuestions = await new Promise((resolve, reject) => {
-        db.all(
-          `SELECT SUM(weightage) as maxMarks
-           FROM questions
-           WHERE courseId = ? AND coNumber = ?`,
-          [courseId, `CO${co}`],
-          (err, rows) => {
-            if (err) reject(err);
-            else resolve(rows[0]?.maxMarks || 0);
-          }
-        );
-      });
-      coMaxMarks[`CO${co}`] = coQuestions;
+      const coResult = await pgPool.query(
+        `SELECT SUM(weightage) as maxmarks
+         FROM questions
+         WHERE courseid = $1 AND conumber = $2`,
+        [courseId, `CO${co}`]
+      );
+      coMaxMarks[`CO${co}`] = coResult.rows[0]?.maxmarks || 0;
     }
     console.log(`Max marks per CO for course ID ${courseId}:`, coMaxMarks);
 
     // Step 5: Calculate results for each student who took the exam
     const results = await Promise.all(students.map(async (student, index) => {
       const studentId = student.id;
-      const studentExamsForThisStudent = studentExams.filter(se => se.studentId === studentId);
+      const studentExamsForThisStudent = studentExams.filter(se => se.studentid === studentId);
 
       // Check if the student has any malpractice flag in their exam submissions
-      const hasMalpractice = studentExamsForThisStudent.some(se => se.malpracticeFlag === 1);
+      const hasMalpractice = studentExamsForThisStudent.some(se => se.malpracticeflag);
       console.log(`Student ID ${studentId}: hasMalpractice=${hasMalpractice}`);
 
       let result = {
@@ -309,7 +248,7 @@ router.get('/:courseId/download', async (req, res) => {
       // Calculate CO-wise marks
       const coMarks = {};
       for (let co = 1; co <= coCount; co++) {
-        const coQuestions = studentExamsForThisStudent.filter(se => se.coNumber === `CO${co}`);
+        const coQuestions = studentExamsForThisStudent.filter(se => se.conumber === `CO${co}`);
         console.log(`Student ID ${studentId}, CO${co} questions:`, coQuestions);
         if (coQuestions.length === 0) {
           // If no questions answered for this CO, mark as 'A'
@@ -318,7 +257,7 @@ router.get('/:courseId/download', async (req, res) => {
         } else {
           let totalMarks = 0;
           coQuestions.forEach(q => {
-            if (q.selectedAnswer === q.answer) {
+            if (q.selectedanswer === q.answer) {
               totalMarks += q.weightage;
             }
           });
@@ -342,12 +281,12 @@ router.get('/:courseId/download', async (req, res) => {
       // Calculate overall marks dynamically from student_exams
       let overallMarks = 0;
       studentExamsForThisStudent.forEach(se => {
-        if (se.selectedAnswer === se.answer) {
+        if (se.selectedanswer === se.answer) {
           overallMarks += se.weightage;
         }
       });
 
-      // Use examMarks from courses table for overall percentage
+      // Use examMarks for overall percentage
       const overallPercentage = examMarks ? ((overallMarks / examMarks) * 100).toFixed(2) : '0.00';
       console.log(`Student ID ${studentId}: overallMarks=${overallMarks}, examMarks=${examMarks}, overallPercentage=${overallPercentage}`);
 
@@ -416,17 +355,17 @@ router.get('/:courseId/download', async (req, res) => {
 
     res.download(filePath, `${courseName}_Results_${Date.now()}.xlsx`, (err) => {
       if (err) {
-        console.error('Error sending Excel file:', err);
+        console.error('Error sending Excel file:', err.message);
         res.status(500).json({ error: 'Failed to download the report' });
       }
       // Delete the file after sending
       fs.unlink(filePath, (unlinkErr) => {
-        if (unlinkErr) console.error('Error deleting Excel file:', unlinkErr);
+        if (unlinkErr) console.error('Error deleting Excel file:', unlinkErr.message);
         else console.log(`Excel file deleted: ${filePath}`);
       });
     });
   } catch (error) {
-    console.error('Error generating Excel report:', error);
+    console.error('Error generating Excel report:', error.message);
     res.status(500).json({ error: 'Failed to generate the report' });
   }
 });
