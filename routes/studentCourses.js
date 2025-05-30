@@ -18,21 +18,24 @@ router.get('/:studentId', async (req, res) => {
 
   try {
     const { rows } = await pgPool.query(
-      `SELECT c.id, c.name, c.learning_platform AS learningplatform, c.course_code AS coursecode, 
-              c.examdate, c.examtime, c.examquestioncount, c.exammarks, sc.iseligible, sc.paymentconfirmed,
+      `SELECT c.id, c.name, c.learning_platform AS learningPlatform, c.course_code AS courseCode, 
+              c.examDate, c.examTime, c.examQuestionCount, c.examMarks, sc.isEligible, sc.paymentConfirmed,
               CASE WHEN EXISTS (
-                SELECT 1 FROM student_exams se WHERE se.studentid = sc.studentid AND se.courseid = c.id
-              ) THEN TRUE ELSE FALSE END AS hascompleted,
-              c.isdraft
+                SELECT 1 FROM student_exams se WHERE se.studentId = sc.studentId AND se.courseId = c.id
+              ) THEN TRUE ELSE FALSE END AS hasCompleted,
+              c.isDraft
        FROM courses c
-       JOIN student_courses sc ON c.id = sc.courseid
-       WHERE sc.studentid = $1 AND c.isdraft = FALSE`,
+       JOIN student_courses sc ON c.id = sc.courseId
+       WHERE sc.studentId = $1 AND c.isDraft = FALSE`,
       [studentId]
     );
-    console.log(`Fetched ${rows.length} courses for student ${studentId}`);
+    console.log(`Fetched ${rows.length} courses for student ${studentId}:`, rows);
     const modifiedRows = rows.map(row => ({
       ...row,
       duration: 120,
+      hasCompleted: row.hasCompleted || false, // Ensure boolean
+      isEligible: row.isEligible || false, // Ensure boolean
+      paymentConfirmed: row.paymentConfirmed || false, // Ensure boolean
     }));
     res.json(modifiedRows);
   } catch (err) {
@@ -48,7 +51,7 @@ router.get('/questions/:courseId', async (req, res) => {
 
   try {
     const courseResult = await pgPool.query(
-      `SELECT examquestioncount, exammarks, cocount FROM courses WHERE id = $1`,
+      `SELECT examQuestionCount, examMarks, coCount FROM courses WHERE id = $1`,
       [courseId]
     );
     if (courseResult.rows.length === 0) {
@@ -56,9 +59,9 @@ router.get('/questions/:courseId', async (req, res) => {
     }
 
     const course = courseResult.rows[0];
-    const examQuestionCount = course.examquestioncount || 0;
-    const examMarks = course.exammarks || 0;
-    const coCount = course.cocount || 0;
+    const examQuestionCount = course.examQuestionCount || 0;
+    const examMarks = course.examMarks || 0;
+    const coCount = course.coCount || 0;
 
     if (coCount === 0) {
       return res.status(400).json({ error: 'No COs defined for this course' });
@@ -71,17 +74,17 @@ router.get('/questions/:courseId', async (req, res) => {
     console.log(`Course ${courseId} - Total marks: ${totalMarks}, W1: ${w1}, W2: ${w2}`);
 
     if (w1 < 0 || w2 < 0) {
-      return res.status(400).json({ error: 'Invalid examquestioncount or exammarks' });
+      return res.status(400).json({ error: 'Invalid examQuestionCount or examMarks' });
     }
 
     const marksPerCO = Math.floor(totalMarks / coCount);
     const remainingMarks = totalMarks - (marksPerCO * coCount);
 
     const questionResult = await pgPool.query(
-      `SELECT id, question, questionimage, option1, option1image, option2, option2image, 
-              option3, option3image, option4, option4image, weightage, conumber
+      `SELECT id, question, questionImage, option1, option1Image, option2, option2Image, 
+              option3, option3Image, option4, option4Image, weightage, coNumber
        FROM questions
-       WHERE courseid = $1`,
+       WHERE courseId = $1`,
       [courseId]
     );
     const rows = questionResult.rows;
@@ -91,8 +94,8 @@ router.get('/questions/:courseId', async (req, res) => {
     for (let i = 1; i <= coCount; i++) {
       const coNum = `CO${i}`;
       questionsByCO[coNum] = {
-        weightage1: rows.filter(q => q.conumber === coNum && q.weightage === 1),
-        weightage2: rows.filter(q => q.conumber === coNum && q.weightage === 2),
+        weightage1: rows.filter(q => q.coNumber === coNum && q.weightage === 1),
+        weightage2: rows.filter(q => q.coNumber === coNum && q.weightage === 2),
       };
     }
 
@@ -141,14 +144,14 @@ router.get('/questions/:courseId', async (req, res) => {
         selectedQuestions.phase2.push(question);
         remainingMarksToSelect -= 2;
         totalMarksSelected += 2;
-        const coNum = question.conumber;
+        const coNum = question.coNumber;
         questionsByCO[coNum].weightage2 = questionsByCO[coNum].weightage2.filter(q => q.id !== question.id);
       } else if (allRemainingW1.length > 0) {
         const question = allRemainingW1.shift();
         selectedQuestions.phase1.push(question);
         remainingMarksToSelect -= 1;
         totalMarksSelected += 1;
-        const coNum = question.conumber;
+        const coNum = question.coNumber;
         questionsByCO[coNum].weightage1 = questionsByCO[coNum].weightage1.filter(q => q.id !== question.id);
       } else {
         break;
@@ -169,19 +172,19 @@ router.get('/questions/:courseId', async (req, res) => {
     const modifiedQuestions = {
       phase1: selectedQuestions.phase1.map(row => ({
         ...row,
-        questionimage: normalizePath(row.questionimage),
-        option1image: normalizePath(row.option1image),
-        option2image: normalizePath(row.option2image),
-        option3image: normalizePath(row.option3image),
-        option4image: normalizePath(row.option4image),
+        questionImage: normalizePath(row.questionImage),
+        option1Image: normalizePath(row.option1Image),
+        option2Image: normalizePath(row.option2Image),
+        option3Image: normalizePath(row.option3Image),
+        option4Image: normalizePath(row.option4Image),
       })),
       phase2: selectedQuestions.phase2.map(row => ({
         ...row,
-        questionimage: normalizePath(row.questionimage),
-        option1image: normalizePath(row.option1image),
-        option2image: normalizePath(row.option2image),
-        option3image: normalizePath(row.option3image),
-        option4image: normalizePath(row.option4image),
+        questionImage: normalizePath(row.questionImage),
+        option1Image: normalizePath(row.option1Image),
+        option2Image: normalizePath(row.option2Image),
+        option3Image: normalizePath(row.option3Image),
+        option4Image: normalizePath(row.option4Image),
       })),
     };
 
@@ -203,7 +206,7 @@ router.post('/submit-answer', async (req, res) => {
 
   try {
     const existingResult = await pgPool.query(
-      `SELECT 1 FROM student_exams WHERE studentid = $1 AND courseid = $2 AND questionid = $3 LIMIT 1`,
+      `SELECT 1 FROM student_exams WHERE studentId = $1 AND courseId = $2 AND questionId = $3 LIMIT 1`,
       [studentId, courseId, questionId]
     );
     if (existingResult.rows.length > 0) {
@@ -212,7 +215,7 @@ router.post('/submit-answer', async (req, res) => {
 
     const currentTime = new Date().toISOString();
     await pgPool.query(
-      `INSERT INTO student_exams (studentid, courseid, questionid, selectedanswer, starttime, endtime, malpracticeflag) 
+      `INSERT INTO student_exams (studentId, courseId, questionId, selectedAnswer, startTime, endTime, malpracticeFlag) 
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [studentId, courseId, questionId, selectedAnswer, currentTime, currentTime, false]
     );
@@ -239,7 +242,7 @@ router.post('/submit-exam', async (req, res) => {
     await client.query('BEGIN');
 
     const existingResult = await client.query(
-      `SELECT 1 FROM student_exams WHERE studentid = $1 AND courseid = $2 LIMIT 1`,
+      `SELECT 1 FROM student_exams WHERE studentId = $1 AND courseId = $2 LIMIT 1`,
       [studentId, courseId]
     );
     if (existingResult.rows.length > 0) {
@@ -258,7 +261,7 @@ router.post('/submit-exam', async (req, res) => {
       }
 
       await client.query(
-        `INSERT INTO student_exams (studentid, courseid, questionid, selectedanswer, starttime, endtime, malpracticeflag) 
+        `INSERT INTO student_exams (studentId, courseId, questionId, selectedAnswer, startTime, endTime, malpracticeFlag) 
          VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [studentId, courseId, questionId, selectedAnswer, startTime, currentTime, malpracticeFlag]
       );
@@ -291,7 +294,7 @@ router.post('/malpractice', async (req, res) => {
   try {
     const timestamp = new Date().toISOString();
     await pgPool.query(
-      `INSERT INTO malpractice_logs (studentid, courseid, type, timestamp) 
+      `INSERT INTO malpractice_logs (studentId, courseId, type, timestamp) 
        VALUES ($1, $2, $3, $4)`,
       [studentId, courseId, type, timestamp]
     );
