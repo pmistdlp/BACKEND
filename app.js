@@ -170,6 +170,31 @@ try {
     res.json({ routes });
   });
 
+  // Backup route to download the database file (accessible to anyone)
+  app.get('/api/backup', (req, res) => {
+    const dbPath = path.resolve(__dirname, 'exam.db'); // Path from model.js
+    console.log(`[${new Date().toISOString()}] Backup requested for database at: ${dbPath}`);
+
+    // Check if the database file exists
+    if (!fs.existsSync(dbPath)) {
+      console.error(`Database file not found at: ${dbPath}`);
+      return res.status(404).json({ error: 'Database file not found' });
+    }
+
+    // Set headers for file download
+    res.setHeader('Content-Disposition', 'attachment; filename=exam.db');
+    res.setHeader('Content-Type', 'application/octet-stream');
+
+    // Send the file
+    res.download(dbPath, 'exam.db', (err) => {
+      if (err) {
+        console.error(`Error sending database file: ${err.message}`);
+        return res.status(500).json({ error: 'Failed to download database' });
+      }
+      console.log(`Database backup downloaded successfully`);
+    });
+  });
+
   // Global error handler
   app.use((err, req, res, next) => {
     console.error('Unhandled error:', err.stack);
