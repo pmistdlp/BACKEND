@@ -47,7 +47,7 @@ try {
 
   // PostgreSQL connection pool
   const pgPool = new Pool({
-    connectionString: 'postgresql://root:QgaoJrvWJaFia6GxETVtRXSNV9P0UVfm@dpg-d0si1oadbo4c73f3midg-a.oregon-postgres.render.com/mooc_vmh7',
+    connectionString: 'postgresql://root:WWolSkro34r8uW7eP5UtsFdWDUg5ZN4Y@dpg-d0tco1be5dus73foa07g-a.singapore-postgres.render.com/mooc_owbe',
     ssl: { rejectUnauthorized: false }
   });
 
