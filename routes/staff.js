@@ -3,20 +3,33 @@ const router = express.Router();
 const pgPool = require('../model');
 const transporter = require('../utils/mailer');
 
+// GET all staff with pagination
 router.get('/', async (req, res) => {
   try {
-    const { rows } = await pgPool.query(`SELECT id, name, username, department, ismaster, email, facultyid FROM staff`);
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const offset = (page - 1) * limit;
+    const { rows } = await pgPool.query(
+      `SELECT id, name, username, department, ismaster, email, facultyid 
+       FROM staff 
+       ORDER BY id 
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
     res.json(rows);
   } catch (err) {
     console.error('Database error fetching staff:', err.message);
-    return res.status(400).json({ error: err.message });
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
+// GET staff by ID
 router.get('/:id', async (req, res) => {
   try {
     const { rows } = await pgPool.query(
-      `SELECT id, name, username, password, department, ismaster, email, facultyid FROM staff WHERE id = $1`,
+      `SELECT id, name, username, department, ismaster, email, facultyid 
+       FROM staff 
+       WHERE id = $1`,
       [req.params.id]
     );
     if (rows.length === 0) {
@@ -25,36 +38,35 @@ router.get('/:id', async (req, res) => {
     res.json(rows[0]);
   } catch (err) {
     console.error('Database error fetching staff:', err.message);
-    return res.status(400).json({ error: err.message });
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
+// POST new staff
 router.post('/', async (req, res) => {
   const { name, username, password, department, isMaster, email, facultyId } = req.body;
   if (!name || !username || !password || !department || !email || !facultyId) {
-    return res.status(400).json({ error: 'Name, Username, Password, Department, Email, and Faculty ID are required' });
+    return res.status(400).json({ error: 'All fields are required' });
   }
 
-  let client;
   try {
-    client = await pgPool.connect();
-    await client.query('BEGIN');
-
-    // Insert into staff table
-    await client.query(
-      `INSERT INTO staff (name, username, password, department, ismaster, email, facultyid) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    await pgPool.query('BEGIN');
+    await pgPool.query(
+      `INSERT INTO staff (name, username, password, department, ismaster, email, facultyid) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [name, username, password, department, isMaster || false, email, facultyId]
     );
 
-    // If isMaster is true, insert into admins table
     if (isMaster) {
-      await client.query(
-        `INSERT INTO admins (username, password, isMaster) VALUES ($1, $2, $3) ON CONFLICT (username) DO NOTHING`,
+      await pgPool.query(
+        `INSERT INTO admins (username, password, isMaster) 
+         VALUES ($1, $2, $3) 
+         ON CONFLICT (username) DO NOTHING`,
         [username, password, true]
       );
     }
 
-    await client.query('COMMIT');
+    await pgPool.query('COMMIT');
 
     try {
       await transporter.sendMail({
@@ -79,81 +91,70 @@ router.post('/', async (req, res) => {
 
     res.json({ message: 'Staff created' });
   } catch (err) {
-    if (client) {
-      await client.query('ROLLBACK');
-    }
+    await pgPool.query('ROLLBACK');
     console.error('Database error creating staff:', err.message);
-    return res.status(400).json({ error: err.message });
-  } finally {
-    if (client) {
-      client.release();
-    }
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
+// PUT update staff
 router.put('/:id', async (req, res) => {
   const { name, username, password, department, isMaster, email, facultyId } = req.body;
   if (!name || !username || !department || !email || !facultyId) {
-    return res.status(400).json({ error: 'Name, Username, Department, Email, and Faculty ID are required' });
+    return res.status(400).json({ error: 'Required fields missing' });
   }
 
-  let client;
   try {
-    client = await pgPool.connect();
-    await client.query('BEGIN');
+    await pgPool.query('BEGIN');
 
-    // Fetch current staff details
-    const staffResult = await client.query(
-      `SELECT name, username, email, ismaster FROM staff WHERE id = $1`,
-      [req.params.id]
-    );
-    if (staffResult.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Faculty not found' });
-    }
-    const currentStaff = staffResult.rows[0];
-
-    // Update staff
     const query = password
-      ? `UPDATE staff SET name = $1, username = $2, password = $3, department = $4, ismaster = $5, email = $6, facultyid = $7 WHERE id = $8`
-      : `UPDATE staff SET name = $1, username = $2, department = $3, ismaster = $4, email = $5, facultyid = $6 WHERE id = $7`;
+      ? `UPDATE staff 
+         SET name = $1, username = $2, password = $3, department = $4, ismaster = $5, email = $6, facultyid = $7 
+         WHERE id = $8 
+         RETURNING ismaster, username, email, name`
+      : `UPDATE staff 
+         SET name = $1, username = $2, department = $3, ismaster = $4, email = $5, facultyid = $6 
+         WHERE id = $7 
+         RETURNING ismaster, username, email, name`;
+
     const params = password
       ? [name, username, password, department, isMaster || false, email, facultyId, req.params.id]
       : [name, username, department, isMaster || false, email, facultyId, req.params.id];
 
-    const updateResult = await client.query(query, params);
-    if (updateResult.rowCount === 0) {
-      await client.query('ROLLBACK');
+    const { rows } = await pgPool.query(query, params);
+    if (rows.length === 0) {
+      await pgPool.query('ROLLBACK');
       return res.status(404).json({ error: 'Faculty not found' });
     }
 
-    // Handle admins table based on isMaster change
-    if (isMaster && !currentStaff.ismaster) {
-      // Add to admins if newly set as master
-      await client.query(
-        `INSERT INTO admins (username, password, isMaster) VALUES ($1, $2, $3) ON CONFLICT (username) DO UPDATE SET password = EXCLUDED.password, isMaster = EXCLUDED.isMaster`,
-        [username, password || currentStaff.password, true]
+    const updatedStaff = rows[0];
+
+    if (isMaster && !updatedStaff.ismaster) {
+      await pgPool.query(
+        `INSERT INTO admins (username, password, isMaster) 
+         VALUES ($1, $2, $3) 
+         ON CONFLICT (username) DO UPDATE 
+         SET password = EXCLUDED.password, isMaster = EXCLUDED.isMaster`,
+        [username, password || updatedStaff.password, true]
       );
-    } else if (!isMaster && currentStaff.ismaster) {
-      // Remove from admins if master status is revoked
-      await client.query(`DELETE FROM admins WHERE username = $1`, [currentStaff.username]);
-    } else if (isMaster && currentStaff.ismaster && password) {
-      // Update password in admins if master and password changed
-      await client.query(
+    } else if (!isMaster && updatedStaff.ismaster) {
+      await pgPool.query(`DELETE FROM admins WHERE username = $1`, [updatedStaff.username]);
+    } else if (isMaster && updatedStaff.ismaster && password) {
+      await pgPool.query(
         `UPDATE admins SET password = $1 WHERE username = $2`,
         [password, username]
       );
     }
 
-    await client.query('COMMIT');
+    await pgPool.query('COMMIT');
 
     try {
       await transporter.sendMail({
         from: 'salmanparies18@gmail.com',
-        to: currentStaff.email,
+        to: updatedStaff.email,
         subject: 'NPTEL-SOFTWARE - Staff Account Updated',
         text: `
-          Hello ${currentStaff.name},
+          Hello ${updatedStaff.name},
           Your staff account has been updated!
           Updated Details:
           Name: ${name}
@@ -172,51 +173,35 @@ router.put('/:id', async (req, res) => {
 
     res.json({ message: 'Staff updated' });
   } catch (err) {
-    if (client) {
-      await client.query('ROLLBACK');
-    }
+    await pgPool.query('ROLLBACK');
     console.error('Database error updating staff:', err.message);
-    return res.status(400).json({ error: err.message });
-  } finally {
-    if (client) {
-      client.release();
-    }
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
+// DELETE staff
 router.delete('/:id', async (req, res) => {
-  let client;
   try {
-    client = await pgPool.connect();
-    await client.query('BEGIN');
+    await pgPool.query('BEGIN');
 
-    // Fetch staff details before deletion
-    const staffResult = await client.query(
-      `SELECT name, username, email, ismaster FROM staff WHERE id = $1`,
+    const { rows } = await pgPool.query(
+      `SELECT name, username, email, ismaster 
+       FROM staff 
+       WHERE id = $1`,
       [req.params.id]
     );
-    if (staffResult.rows.length === 0) {
-      await client.query('ROLLBACK');
+    if (rows.length === 0) {
+      await pgPool.query('ROLLBACK');
       return res.status(404).json({ error: 'Faculty not found' });
     }
-    const staff = staffResult.rows[0];
+    const staff = rows[0];
 
-    // Delete from admins if ismaster
     if (staff.ismaster) {
-      await client.query(`DELETE FROM admins WHERE username = $1`, [staff.username]);
+      await pgPool.query(`DELETE FROM admins WHERE username = $1`, [staff.username]);
     }
 
-    // Delete from staff
-    const deleteResult = await client.query(
-      `DELETE FROM staff WHERE id = $1`,
-      [req.params.id]
-    );
-    if (deleteResult.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Faculty not found' });
-    }
-
-    await client.query('COMMIT');
+    await pgPool.query(`DELETE FROM staff WHERE id = $1`, [req.params.id]);
+    await pgPool.query('COMMIT');
 
     try {
       await transporter.sendMail({
@@ -237,15 +222,9 @@ router.delete('/:id', async (req, res) => {
 
     res.json({ message: 'Staff deleted' });
   } catch (err) {
-    if (client) {
-      await client.query('ROLLBACK');
-    }
+    await pgPool.query('ROLLBACK');
     console.error('Database error deleting staff:', err.message);
-    return res.status(400).json({ error: err.message });
-  } finally {
-    if (client) {
-      client.release();
-    }
+    res.status(500).json({ error: 'Server error' });
   }
 });
 

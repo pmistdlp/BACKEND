@@ -20,6 +20,7 @@ try {
   const ResultsRoutes = require('./routes/results');
   const studentProfileRoutes = require('./routes/studentProfile');
   const authRoutes = require('./routes/auth');
+  const studentExamsRoutes = require('./routes/studentExams');
 
   const app = express();
 
@@ -169,6 +170,7 @@ try {
   app.use('/api/student-profile', studentProfileRoutes);
   app.use('/api/results', ResultsRoutes);
   app.use('/api', authRoutes);
+  app.use('/api/student-exams', studentExamsRoutes);
 
   // Debug endpoint to list all registered routes
   app.get('/api/debug/routes', (req, res) => {
