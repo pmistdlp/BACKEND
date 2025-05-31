@@ -1,307 +1,250 @@
 const express = require('express');
 const router = express.Router();
-const pgPool = require('../model');
+const pgPool = require('../model'); // Import pgPool from model.js
+const fs = require('fs').promises;
+const path = require('path');
 
-// Utility to shuffle an array (Fisher-Yates shuffle)
-function shuffleArray(array) {
-  for (let i = array.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [array[i], array[j]] = [array[j], array[i]];
+// Define the base path for uploads
+const UPLOADS_DIR = path.join(__dirname, '..', 'Uploads');
+
+// Middleware to verify session
+const verifySession = (req, res, next) => {
+  const session = req.session;
+  const studentId = req.params.studentId || req.body.studentId;
+  console.log(`[${new Date().toISOString()}] [verifySession] SessionID: ${req.sessionID}, Session:`, JSON.stringify(session, null, 2));
+  console.log(`[${new Date().toISOString()}] [verifySession] Checking studentId: ${studentId}, User:`, JSON.stringify(session.user || {}));
+
+  if (!session || !session.user || !session.user.id || session.user.id !== parseInt(studentId)) {
+    console.log(`[Unauthorized] Invalid session for studentId ${studentId}. Session user:`, session.user);
+    return res.status(401).json({ error: 'Unauthorized or invalid session' });
   }
-  return array;
-}
+  req.user = session.user;
+  console.log(`[${new Date().toISOString()}] Session valid for user:`, session.user);
+  next();
+};
 
-// Fetch courses for a student
-router.get('/:studentId', async (req, res) => {
-  const studentId = req.params.studentId;
-  console.log(`GET /api/student/student-courses/${studentId} at ${new Date().toISOString()}`);
+// GET /api/student-courses/complete-details/:studentId
+router.get('/complete-details/:studentId', verifySession, async (req, res) => {
+  const { studentId } = req.params;
+  const limit = parseInt(req.query.limit) || 10;
+  const offset = parseInt(req.query.offset) || 0;
+
+  console.log(`[${new Date().toISOString()}] [GET /api/student-courses/complete-details/${studentId}] limit=${limit} offset=${offset}`);
 
   try {
-    const { rows } = await pgPool.query(
-      `SELECT c.id, c.name, c.learning_platform AS learningPlatform, c.course_code AS courseCode, 
-              c.examDate, c.examTime, c.examQuestionCount, c.examMarks, sc.isEligible, sc.paymentConfirmed,
-              CASE WHEN EXISTS (
-                SELECT 1 FROM student_exams se WHERE se.studentId = sc.studentId AND se.courseId = c.id
-              ) THEN TRUE ELSE FALSE END AS hasCompleted,
-              c.isDraft
-       FROM courses c
-       JOIN student_courses sc ON c.id = sc.courseId
-       WHERE sc.studentId = $1 AND c.isDraft = FALSE`,
-      [studentId]
-    );
-    console.log(`Fetched ${rows.length} courses for student ${studentId}:`, rows);
-    const modifiedRows = rows.map(row => ({
-      ...row,
-      duration: 120,
-      hasCompleted: row.hasCompleted || false, // Ensure boolean
-      isEligible: row.isEligible || false, // Ensure boolean
-      paymentConfirmed: row.paymentConfirmed || false, // Ensure boolean
+    // Validate studentId
+    if (!/^\d+$/.test(studentId)) {
+      console.log(`Invalid studentId: ${studentId}`);
+      return res.status(400).json({ error: 'Invalid student ID' });
+    }
+
+    // Step 1: Fetch student details
+    console.log(`Fetching student details for studentId ${studentId}`);
+    const studentQuery = `
+      SELECT id, name, registerNo, abcId, photo
+      FROM students
+      WHERE id = $1
+    `;
+    const studentResult = await pgPool.query(studentQuery, [studentId]);
+
+    if (studentResult.rows.length === 0) {
+      console.log(`Student ID ${studentId} not found`);
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    const studentData = studentResult.rows[0];
+    console.log(`Raw student data fetched:`, studentData);
+
+    // Step 2: Validate photo file
+    let photoPath = null;
+    if (studentData.photo) {
+      const fullPhotoPath = path.join(UPLOADS_DIR, studentData.photo.replace(/^\/Uploads\//, ''));
+      try {
+        await fs.access(fullPhotoPath);
+        photoPath = studentData.photo.startsWith('/Uploads/') 
+          ? studentData.photo 
+          : `/Uploads/${studentData.photo}`;
+        console.log(`Photo found for studentId ${studentId}: ${fullPhotoPath}`);
+      } catch (err) {
+        console.log(`Photo file not found for studentId ${studentId}: ${fullPhotoPath}`);
+        photoPath = null;
+      }
+    }
+
+    // Step 3: Fetch assigned courses
+    console.log(`Fetching assigned courses for studentId ${studentId}`);
+    const coursesQuery = `
+      SELECT 
+        c.id AS courseid,
+        c.name AS coursename,
+        c.course_code AS coursecode,
+        c.learning_platform AS learningplatform,
+        c.examDate AS examdate,
+        c.examTime AS examtime,
+        c.examQuestionCount AS examquestioncount,
+        c.examMarks AS exammarks,
+        c.coCount AS cocount,
+        c.isRegistrationOpen AS isregistrationopen,
+        c.isDraft AS isdraft,
+        sc.isEligible AS iseligible,
+        sc.paymentConfirmed AS paymentconfirmed,
+        sc.startDate AS startdate,
+        sc.startTime AS starttime,
+        (SELECT COUNT(*) > 0 
+         FROM student_results sr 
+         WHERE sr.studentId = sc.studentId AND sr.courseId = sc.courseId) AS hascompleted,
+        (SELECT COUNT(*) > 0 
+         FROM malpractice_logs ml 
+         WHERE ml.studentId = sc.studentId AND ml.courseId = sc.courseId) AS hasmalpractice,
+        (SELECT COUNT(*) > 0 
+         FROM student_exams se 
+         WHERE se.studentId = sc.studentId AND se.courseId = se.courseId AND se.endTime IS NOT NULL) AS hasexited
+      FROM student_courses sc
+      JOIN courses c ON sc.courseId = c.id
+      WHERE sc.studentId = $1
+      ORDER BY c.id
+      LIMIT $2 OFFSET $3
+    `;
+    const coursesResult = await pgPool.query(coursesQuery, [studentId, limit, offset]);
+
+    console.log(`Raw course data fetched (${coursesResult.rows.length} courses):`, coursesResult.rows);
+
+    // Step 4: Format courses response
+    const courses = coursesResult.rows.map((course) => ({
+      courseid: course.courseid,
+      coursename: course.coursename.trim(), // Trim to remove trailing spaces
+      coursecode: course.coursecode,
+      learningplatform: course.learningplatform,
+      examdate: course.examdate,
+      examtime: course.examtime,
+      examquestioncount: course.examquestioncount,
+      exammarks: course.exammarks,
+      cocount: course.cocount,
+      isregistrationopen: course.isregistrationopen,
+      isdraft: course.isdraft,
+      iseligible: course.iseligible,
+      paymentconfirmed: course.paymentconfirmed,
+      startdate: course.startdate,
+      starttime: course.starttime,
+      hascompleted: course.hascompleted,
+      hasmalpractice: course.hasmalpractice,
+      hasexited: course.hasexited,
     }));
-    res.json(modifiedRows);
+
+    // Step 5: Build final response
+    const response = {
+      student: {
+        id: studentData.id,
+        name: studentData.name,
+        registerNo: studentData.registerNo || 'N/A',
+        abcId: studentData.abcId || 'N/A',
+        photo: photoPath,
+      },
+      courses,
+    };
+
+    console.log(`Final response for studentId ${studentId}:`, response);
+    res.json(response);
   } catch (err) {
-    console.error('Error fetching student courses:', err.message, err.stack);
-    return res.status(500).json({ error: `Internal server error: ${err.message}` });
+    console.error(`Error fetching details for studentId ${studentId}:`, err.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Fetch questions for a course
-router.get('/questions/:courseId', async (req, res) => {
-  const courseId = req.params.courseId;
-  console.log(`GET /api/student/student-courses/questions/${courseId} at ${new Date().toISOString()}`);
+// POST /api/student-courses/hall-ticket
+router.post('/hall-ticket', async (req, res) => {
+  const { courseId, studentId } = req.body;
+
+  console.log(`[${new Date().toISOString()}] [POST /api/student-courses/hall-ticket] studentId=${studentId}, courseId=${courseId}`);
 
   try {
-    const courseResult = await pgPool.query(
-      `SELECT examQuestionCount, examMarks, coCount FROM courses WHERE id = $1`,
-      [courseId]
-    );
+    // Validate inputs
+    if (!courseId || !/^\d+$/.test(courseId)) {
+      console.log(`Invalid courseId: ${courseId}`);
+      return res.status(400).json({ error: 'Invalid course ID' });
+    }
+    if (!studentId || !/^\d+$/.test(studentId)) {
+      console.log(`Invalid studentId: ${studentId}`);
+      return res.status(400).json({ error: 'Invalid student ID' });
+    }
+
+    // Fetch student details
+    console.log(`Fetching student details for studentId ${studentId}`);
+    const studentQuery = `
+      SELECT id, name, registerNo, abcId, photo
+      FROM students
+      WHERE id = $1
+    `;
+    const studentResult = await pgPool.query(studentQuery, [studentId]);
+
+    if (studentResult.rows.length === 0) {
+      console.log(`Student ID ${studentId} not found`);
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    const studentData = studentResult.rows[0];
+    console.log(`Raw student data fetched:`, studentData);
+
+    // Fetch course details
+    console.log(`Fetching course details for courseId ${courseId}`);
+    const courseQuery = `
+      SELECT id, name, course_code AS courseCode, learning_platform, examDate, examTime
+      FROM courses
+      WHERE id = $1
+    `;
+    const courseResult = await pgPool.query(courseQuery, [courseId]);
+
     if (courseResult.rows.length === 0) {
+      console.log(`Course ID ${courseId} not found`);
       return res.status(404).json({ error: 'Course not found' });
     }
 
-    const course = courseResult.rows[0];
-    const examQuestionCount = course.examQuestionCount || 0;
-    const examMarks = course.examMarks || 0;
-    const coCount = course.coCount || 0;
+    const courseData = courseResult.rows[0];
+    console.log(`Raw course data fetched:`, courseData);
 
-    if (coCount === 0) {
-      return res.status(400).json({ error: 'No COs defined for this course' });
+    // Verify enrollment
+    console.log(`Verifying enrollment for studentId ${studentId} in courseId ${courseId}`);
+    const enrollmentQuery = `
+      SELECT isEligible, paymentConfirmed
+      FROM student_courses
+      WHERE studentId = $1 AND courseId = $2
+    `;
+    const enrollmentResult = await pgPool.query(enrollmentQuery, [studentId, courseId]);
+
+    if (enrollmentResult.rows.length === 0) {
+      console.log(`No enrollment found for student ${studentId} in course ${courseId}`);
+      return res.status(404).json({ error: 'Student not enrolled in this course' });
     }
 
-    const w2 = examMarks - examQuestionCount;
-    const w1 = examQuestionCount - w2;
-    const totalMarks = w1 * 1 + w2 * 2;
+    const enrollmentData = enrollmentResult.rows[0];
+    console.log(`Enrollment data:`, enrollmentData);
 
-    console.log(`Course ${courseId} - Total marks: ${totalMarks}, W1: ${w1}, W2: ${w2}`);
+    // Format hall ticket data
+    const hallTickets = [{
+      student: {
+        id: studentData.id,
+        name: studentData.name || 'N/A',
+        registerNo: studentData.registerNo || 'N/A',
+        abcId: studentData.abcId || 'N/A',
+        photo: studentData.photo || null,
+        isEligible: enrollmentData.isEligible,
+        paymentConfirmed: enrollmentData.paymentConfirmed,
+      },
+      course: {
+        id: courseData.id,
+        name: courseData.name.trim(),
+        courseCode: courseData.courseCode || 'N/A',
+        learningPlatform: courseData.learning_platform,
+        examDate: courseData.examDate,
+        examTime: courseData.examTime,
+      },
+    }];
 
-    if (w1 < 0 || w2 < 0) {
-      return res.status(400).json({ error: 'Invalid examQuestionCount or examMarks' });
-    }
-
-    const marksPerCO = Math.floor(totalMarks / coCount);
-    const remainingMarks = totalMarks - (marksPerCO * coCount);
-
-    const questionResult = await pgPool.query(
-      `SELECT id, question, questionImage, option1, option1Image, option2, option2Image, 
-              option3, option3Image, option4, option4Image, weightage, coNumber
-       FROM questions
-       WHERE courseId = $1`,
-      [courseId]
-    );
-    const rows = questionResult.rows;
-    console.log(`Fetched ${rows.length} questions for course ${courseId}`);
-
-    const questionsByCO = {};
-    for (let i = 1; i <= coCount; i++) {
-      const coNum = `CO${i}`;
-      questionsByCO[coNum] = {
-        weightage1: rows.filter(q => q.coNumber === coNum && q.weightage === 1),
-        weightage2: rows.filter(q => q.coNumber === coNum && q.weightage === 2),
-      };
-    }
-
-    const selectedQuestions = { phase1: [], phase2: [] };
-    let totalMarksSelected = 0;
-
-    for (let i = 1; i <= coCount; i++) {
-      const coNum = `CO${i}`;
-      let marksForThisCO = 0;
-      const w1Questions = shuffleArray([...questionsByCO[coNum].weightage1]);
-      const w2Questions = shuffleArray([...questionsByCO[coNum].weightage2]);
-
-      while (marksForThisCO + 2 <= marksPerCO && w2Questions.length > 0) {
-        const question = w2Questions.shift();
-        selectedQuestions.phase2.push(question);
-        marksForThisCO += 2;
-        totalMarksSelected += 2;
-      }
-
-      while (marksForThisCO < marksPerCO && w1Questions.length > 0) {
-        const question = w1Questions.shift();
-        selectedQuestions.phase1.push(question);
-        marksForThisCO += 1;
-        totalMarksSelected += 1;
-      }
-
-      questionsByCO[coNum].weightage1 = w1Questions;
-      questionsByCO[coNum].weightage2 = w2Questions;
-    }
-
-    let remainingMarksToSelect = remainingMarks;
-    while (remainingMarksToSelect > 0) {
-      const allRemainingW1 = [];
-      const allRemainingW2 = [];
-      for (let i = 1; i <= coCount; i++) {
-        const coNum = `CO${i}`;
-        allRemainingW1.push(...questionsByCO[coNum].weightage1);
-        allRemainingW2.push(...questionsByCO[coNum].weightage2);
-      }
-
-      shuffleArray(allRemainingW1);
-      shuffleArray(allRemainingW2);
-
-      if (remainingMarksToSelect >= 2 && allRemainingW2.length > 0) {
-        const question = allRemainingW2.shift();
-        selectedQuestions.phase2.push(question);
-        remainingMarksToSelect -= 2;
-        totalMarksSelected += 2;
-        const coNum = question.coNumber;
-        questionsByCO[coNum].weightage2 = questionsByCO[coNum].weightage2.filter(q => q.id !== question.id);
-      } else if (allRemainingW1.length > 0) {
-        const question = allRemainingW1.shift();
-        selectedQuestions.phase1.push(question);
-        remainingMarksToSelect -= 1;
-        totalMarksSelected += 1;
-        const coNum = question.coNumber;
-        questionsByCO[coNum].weightage1 = questionsByCO[coNum].weightage1.filter(q => q.id !== question.id);
-      } else {
-        break;
-      }
-    }
-
-    if (selectedQuestions.phase1.length !== w1 || selectedQuestions.phase2.length !== w2) {
-      return res.status(400).json({ error: `Not enough questions: required ${w1} W1 and ${w2} W2, got ${selectedQuestions.phase1.length} and ${selectedQuestions.phase2.length}` });
-    }
-
-    const baseUrl = `${req.protocol}://${req.get('host')}`;
-    const normalizePath = (path) => {
-      if (!path) return null;
-      const normalized = path.replace(/\\/g, '/').replace(/^Uploads\//, '');
-      return `${baseUrl}/Uploads/${normalized}`;
-    };
-
-    const modifiedQuestions = {
-      phase1: selectedQuestions.phase1.map(row => ({
-        ...row,
-        questionImage: normalizePath(row.questionImage),
-        option1Image: normalizePath(row.option1Image),
-        option2Image: normalizePath(row.option2Image),
-        option3Image: normalizePath(row.option3Image),
-        option4Image: normalizePath(row.option4Image),
-      })),
-      phase2: selectedQuestions.phase2.map(row => ({
-        ...row,
-        questionImage: normalizePath(row.questionImage),
-        option1Image: normalizePath(row.option1Image),
-        option2Image: normalizePath(row.option2Image),
-        option3Image: normalizePath(row.option3Image),
-        option4Image: normalizePath(row.option4Image),
-      })),
-    };
-
-    res.json(modifiedQuestions);
+    console.log(`Hall ticket data prepared for studentId ${studentId}:`, hallTickets);
+    res.json({ hallTickets });
   } catch (err) {
-    console.error('Error fetching questions:', err.message, err.stack);
-    return res.status(500).json({ error: `Internal server error: ${err.message}` });
-  }
-});
-
-// Submit a single answer
-router.post('/submit-answer', async (req, res) => {
-  const { studentId, courseId, questionId, selectedAnswer } = req.body;
-  console.log(`POST /api/student/student-courses/submit-answer at ${new Date().toISOString()}:`, { studentId, courseId, questionId });
-
-  if (!studentId || !courseId || !questionId || !selectedAnswer) {
-    return res.status(400).json({ error: 'studentId, courseId, questionId, and selectedAnswer are required' });
-  }
-
-  try {
-    const existingResult = await pgPool.query(
-      `SELECT 1 FROM student_exams WHERE studentId = $1 AND courseId = $2 AND questionId = $3 LIMIT 1`,
-      [studentId, courseId, questionId]
-    );
-    if (existingResult.rows.length > 0) {
-      return res.status(400).json({ error: 'Answer already submitted for this question' });
-    }
-
-    const currentTime = new Date().toISOString();
-    await pgPool.query(
-      `INSERT INTO student_exams (studentId, courseId, questionId, selectedAnswer, startTime, endTime, malpracticeFlag) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [studentId, courseId, questionId, selectedAnswer, currentTime, currentTime, false]
-    );
-
-    res.json({ message: 'Answer submitted successfully' });
-  } catch (err) {
-    console.error('Error submitting answer:', err.message, err.stack);
-    return res.status(500).json({ error: `Failed to submit answer: ${err.message}` });
-  }
-});
-
-// Submit an entire exam
-router.post('/submit-exam', async (req, res) => {
-  const { studentId, courseId, answers, isMalpractice } = req.body;
-  console.log(`POST /api/student/student-courses/submit-exam at ${new Date().toISOString()}:`, { studentId, courseId, isMalpractice });
-
-  if (!studentId || !courseId || !Array.isArray(answers)) {
-    return res.status(400).json({ error: 'studentId, courseId, and answers array are required' });
-  }
-
-  let client;
-  try {
-    client = await pgPool.connect();
-    await client.query('BEGIN');
-
-    const existingResult = await client.query(
-      `SELECT 1 FROM student_exams WHERE studentId = $1 AND courseId = $2 LIMIT 1`,
-      [studentId, courseId]
-    );
-    if (existingResult.rows.length > 0) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Exam already submitted for this course' });
-    }
-
-    const currentTime = new Date().toISOString();
-    const malpracticeFlag = isMalpractice ? true : false;
-
-    for (let index = 0; index < answers.length; index++) {
-      const { questionId, selectedAnswer, startTime } = answers[index];
-      if (!questionId || !startTime) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: `Invalid answer data at index ${index}: questionId and startTime are required` });
-      }
-
-      await client.query(
-        `INSERT INTO student_exams (studentId, courseId, questionId, selectedAnswer, startTime, endTime, malpracticeFlag) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [studentId, courseId, questionId, selectedAnswer, startTime, currentTime, malpracticeFlag]
-      );
-    }
-
-    await client.query('COMMIT');
-    res.json({ message: malpracticeFlag ? 'Exam auto-evaluated due to malpractice' : 'Exam submitted successfully' });
-  } catch (err) {
-    if (client) {
-      await client.query('ROLLBACK');
-    }
-    console.error('Error submitting exam:', err.message, err.stack);
-    return res.status(500).json({ error: `Failed to submit exam: ${err.message}` });
-  } finally {
-    if (client) {
-      client.release();
-    }
-  }
-});
-
-// Log malpractice
-router.post('/malpractice', async (req, res) => {
-  const { studentId, courseId, type } = req.body;
-  console.log(`POST /api/student/student-courses/malpractice at ${new Date().toISOString()}:`, { studentId, courseId, type });
-
-  if (!studentId || !courseId || !type) {
-    return res.status(400).json({ error: 'studentId, courseId, and type are required' });
-  }
-
-  try {
-    const timestamp = new Date().toISOString();
-    await pgPool.query(
-      `INSERT INTO malpractice_logs (studentId, courseId, type, timestamp) 
-       VALUES ($1, $2, $3, $4)`,
-      [studentId, courseId, type, timestamp]
-    );
-    res.json({ message: 'Malpractice logged successfully' });
-  } catch (err) {
-    console.error('Error logging malpractice:', err.message, err.stack);
-    return res.status(500).json({ error: `Failed to log malpractice: ${err.message}` });
+    console.error(`Error generating hall ticket for studentId ${studentId}:`, err.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 

@@ -5,6 +5,7 @@ const multer = require('multer');
 const session = require('express-session');
 const PGSimple = require('connect-pg-simple')(session);
 const { Pool } = require('pg');
+const fs = require('fs');
 
 try {
   const adminRoutes = require('./routes/admin');
@@ -31,7 +32,7 @@ try {
 
   app.use(cors({
     origin: (origin, callback) => {
-      console.log('Request Origin:', origin);
+      console.log(`[${new Date().toISOString()}] Request Origin: ${origin}`);
       if (!origin || allowedOrigins.includes(origin)) {
         callback(null, origin);
       } else {
@@ -47,7 +48,17 @@ try {
   // PostgreSQL connection pool
   const pgPool = new Pool({
     connectionString: 'postgresql://root:QgaoJrvWJaFia6GxETVtRXSNV9P0UVfm@dpg-d0si1oadbo4c73f3midg-a.oregon-postgres.render.com/mooc_vmh7',
-    ssl: { rejectUnauthorized: false } // Required for Render's external PostgreSQL
+    ssl: { rejectUnauthorized: false }
+  });
+
+  // Test database connection
+  pgPool.connect((err, client, release) => {
+    if (err) {
+      console.error('Error connecting to PostgreSQL:', err.message);
+      process.exit(1);
+    }
+    console.log('Connected to PostgreSQL database');
+    release();
   });
 
   // Session middleware
@@ -57,20 +68,20 @@ try {
     createTableIfMissing: true
   });
 
-  // Handle session store errors
   sessionStore.on('error', (error) => {
-    console.error('Session store error:', error.message);
+    console.error(`[${new Date().toISOString()}] Session store error:`, error.message);
   });
 
   app.use(session({
     store: sessionStore,
-    secret: 'your-secret-key', // Replace with a secure secret
+    secret: process.env.SESSION_SECRET || 'a-very-strong-secret',
     resave: false,
     saveUninitialized: false,
     cookie: {
-      secure: process.env.NODE_ENV === 'production', // Set to true in production with HTTPS
+      secure: process.env.NODE_ENV === 'production' ? true : false, // Allow non-secure cookies in development
       httpOnly: true,
-      maxAge: 24 * 60 * 60 * 1000, // 1 day
+      maxAge: 24 * 60 * 60 * 1000,
+      sameSite: 'lax'
     },
   }));
 
@@ -79,14 +90,34 @@ try {
 
   // Log all incoming requests
   app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} SessionID: ${req.sessionID} User: ${JSON.stringify(req.session.user || {})}`);
     next();
+  });
+
+  // Check session endpoint
+  app.get('/api/check-session', (req, res) => {
+    console.log(`[${new Date().toISOString()}] GET /api/check-session SessionID: ${req.sessionID}`);
+    if (req.session.user && req.session.user.role) {
+      console.log(`Session valid for user:`, req.session.user);
+      res.json({
+        isAuthenticated: true,
+        user: {
+          id: req.session.user.id,
+          role: req.session.user.role,
+          name: req.session.user.name,
+          registerNo: req.session.user.registerNo
+        }
+      });
+    } else {
+      console.log('No valid session found');
+      res.status(401).json({ isAuthenticated: false, error: 'No valid session' });
+    }
   });
 
   // Unified login route
   app.post('/api/login', async (req, res) => {
     const { role, username, registerNo, password } = req.body;
-    console.log('Login attempt:', { role, username, registerNo });
+    console.log(`[${new Date().toISOString()}] Login attempt:`, { role, username, registerNo });
 
     if (!role || !password) {
       console.log('Missing role or password');
@@ -169,20 +200,17 @@ try {
 
   // Backup route to download the database file (accessible to anyone)
   app.get('/api/backup', (req, res) => {
-    const dbPath = path.resolve(__dirname, 'exam.db'); // Path from model.js
+    const dbPath = path.resolve(__dirname, 'exam.db');
     console.log(`[${new Date().toISOString()}] Backup requested for database at: ${dbPath}`);
 
-    // Check if the database file exists
     if (!fs.existsSync(dbPath)) {
       console.error(`Database file not found at: ${dbPath}`);
       return res.status(404).json({ error: 'Database file not found' });
     }
 
-    // Set headers for file download
     res.setHeader('Content-Disposition', 'attachment; filename=exam.db');
     res.setHeader('Content-Type', 'application/octet-stream');
 
-    // Send the file
     res.download(dbPath, 'exam.db', (err) => {
       if (err) {
         console.error(`Error sending database file: ${err.message}`);
@@ -194,13 +222,13 @@ try {
 
   // Global error handler
   app.use((err, req, res, next) => {
-    console.error('Unhandled error:', err.stack);
+    console.error(`[${new Date().toISOString()}] Unhandled error:`, err.stack);
     res.status(500).json({ error: 'Something went wrong on the server' });
   });
 
   // Catch-all for 404
   app.use((req, res) => {
-    console.log(`404 Not Found: ${req.method} ${req.url}`);
+    console.log(`[${new Date().toISOString()}] 404 Not Found: ${req.method} ${req.url}`);
     res.status(404).json({ error: 'Not Found' });
   });
 
