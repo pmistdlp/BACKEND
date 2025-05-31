@@ -188,7 +188,7 @@ router.post('/hall-ticket', async (req, res) => {
     // Fetch course details
     console.log(`Fetching course details for courseId ${courseId}`);
     const courseQuery = `
-      SELECT id, name, course_code AS courseCode, learning_platform, examDate, examTime
+      SELECT id, name, course_code AS courseCode, learning_platform AS learningPlatform, examDate, examTime
       FROM courses
       WHERE id = $1
     `;
@@ -224,8 +224,8 @@ router.post('/hall-ticket', async (req, res) => {
       student: {
         id: studentData.id,
         name: studentData.name || 'N/A',
-        registerNo: studentData.registerNo || 'N/A',
-        abcId: studentData.abcId || 'N/A',
+        registerNo: studentData.registerno || 'N/A', // Use exact column name
+        abcId: studentData.abcid || 'N/A', // Use exact column name
         photo: studentData.photo || null,
         isEligible: enrollmentData.isEligible,
         paymentConfirmed: enrollmentData.paymentConfirmed,
@@ -233,14 +233,14 @@ router.post('/hall-ticket', async (req, res) => {
       course: {
         id: courseData.id,
         name: courseData.name.trim(),
-        courseCode: courseData.courseCode || 'N/A',
-        learningPlatform: courseData.learning_platform,
-        examDate: courseData.examDate,
-        examTime: courseData.examTime,
+        courseCode: courseData.coursecode || 'N/A', // Use exact column name
+        learningPlatform: courseData.learningplatform || 'N/A', // Use exact column name
+        examDate: courseData.examdate, // Use exact column name
+        examTime: courseData.examtime, // Use exact column name
       },
     }];
 
-    console.log(`Hall ticket data prepared for studentId ${studentId}:`, hallTickets);
+    console.log(`Hall ticket data prepared for studentId ${studentId}:`, JSON.stringify(hallTickets, null, 2));
     res.json({ hallTickets });
   } catch (err) {
     console.error(`Error generating hall ticket for studentId ${studentId}:`, err.message);
